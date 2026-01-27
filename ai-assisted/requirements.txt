@@ -1,0 +1,14 @@
+# AI-Assisted Terraform Generator Requirements
+
+# For Gemini provider
+google-generativeai>=0.3.0
+
+# For OpenAI provider
+openai>=1.0.0
+
+# For Anthropic/Claude provider
+anthropic>=0.18.0
+
+# Note: You only need to install the provider(s) you plan to use
+# For example, if you only use Gemini:
+#   pip install google-generativeai

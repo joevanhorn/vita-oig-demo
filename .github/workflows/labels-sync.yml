@@ -1,0 +1,62 @@
+name: Sync Labels
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        type: choice
+        options:
+          - lowerdecklabs
+          - production
+          - staging
+          - development
+
+jobs:
+  sync-labels:
+    name: Sync Labels from Okta
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Sync Labels
+        env:
+          OKTA_API_TOKEN: ${{ secrets.OKTA_API_TOKEN }}
+          OKTA_ORG_NAME: ${{ secrets.OKTA_ORG_NAME }}
+          OKTA_BASE_URL: ${{ secrets.OKTA_BASE_URL }}
+        run: |
+          echo "Syncing labels from Okta for environment: ${{ inputs.environment }}..."
+          chmod +x scripts/sync_label_mappings.py
+          python3 scripts/sync_label_mappings.py \
+            --output environments/${{ inputs.environment }}/config/label_mappings_synced.json \
+            | tee sync.log
+
+      - name: Show synced labels
+        if: always()
+        run: |
+          echo "Synced label configuration:"
+          cat environments/${{ inputs.environment }}/config/label_mappings_synced.json | jq '.labels'
+
+      - name: Upload Results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: synced-labels-${{ inputs.environment }}-${{ github.run_number }}
+          path: |
+            sync.log
+            environments/${{ inputs.environment }}/config/label_mappings_synced.json
+          retention-days: 7

@@ -1,0 +1,179 @@
+name: Import Risk Rules
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        type: choice
+        options:
+          - myorg
+          - production
+          - staging
+          - development
+      filter:
+        description: 'Optional filter (e.g., "name sw \"Process\"" or "resourceOrn eq \"orn:...\"")'
+        required: false
+        type: string
+      commit_changes:
+        description: 'Commit imported rules to repository'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+jobs:
+  import-risk-rules:
+    name: Import Risk Rules from Okta
+    runs-on: ubuntu-latest
+
+    environment: ${{ inputs.environment }}
+
+    permissions:
+      contents: write
+      actions: read
+
+    steps:
+      - name: Workflow Overview
+        run: |
+          echo "=================================================="
+          echo "  IMPORT RISK RULES FROM OKTA"
+          echo "=================================================="
+          echo ""
+          echo "Environment: ${{ inputs.environment }}"
+          echo "Operation: Import risk rules (SOD policies) from Okta"
+          echo "Filter: ${{ github.event.inputs.filter || 'None (all rules)' }}"
+          echo "Commit Changes: ${{ github.event.inputs.commit_changes }}"
+          echo "=================================================="
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Set up environment variables
+        env:
+          OKTA_API_TOKEN: ${{ secrets.OKTA_API_TOKEN }}
+          OKTA_ORG_NAME: ${{ secrets.OKTA_ORG_NAME }}
+          OKTA_BASE_URL: ${{ secrets.OKTA_BASE_URL }}
+        run: |
+          echo "OKTA_ORG_NAME=${OKTA_ORG_NAME}" >> $GITHUB_ENV
+          echo "OKTA_BASE_URL=${OKTA_BASE_URL}" >> $GITHUB_ENV
+          echo "OKTA_API_TOKEN=${OKTA_API_TOKEN}" >> $GITHUB_ENV
+
+      - name: Import risk rules
+        id: import
+        run: |
+          chmod +x scripts/import_risk_rules.py
+
+          OUTPUT_FILE="environments/${{ inputs.environment }}/config/risk_rules.json"
+
+          if [ -n "${{ github.event.inputs.filter }}" ]; then
+            echo "Importing risk rules with filter: ${{ github.event.inputs.filter }}"
+            python3 scripts/import_risk_rules.py \
+              --output "$OUTPUT_FILE" \
+              --filter "${{ github.event.inputs.filter }}" \
+              2>&1 | tee import.log
+          else
+            echo "Importing all risk rules..."
+            python3 scripts/import_risk_rules.py \
+              --output "$OUTPUT_FILE" \
+              2>&1 | tee import.log
+          fi
+
+          IMPORT_STATUS=$?
+          echo "import_status=$IMPORT_STATUS" >> $GITHUB_OUTPUT
+
+          # Count imported rules
+          RULE_COUNT=$(jq '.rules | length' "$OUTPUT_FILE")
+          echo "rule_count=$RULE_COUNT" >> $GITHUB_OUTPUT
+
+      - name: Check for changes
+        id: changes
+        run: |
+          if git diff --quiet environments/${{ inputs.environment }}/config/risk_rules.json; then
+            echo "changed=false" >> $GITHUB_OUTPUT
+            echo "No changes detected"
+          else
+            echo "changed=true" >> $GITHUB_OUTPUT
+            echo "Changes detected in risk_rules.json"
+          fi
+
+      - name: Commit and push changes
+        if: steps.changes.outputs.changed == 'true' && github.event.inputs.commit_changes == 'true'
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+
+          git add environments/${{ inputs.environment }}/config/risk_rules.json
+
+          git commit -m "chore: Import risk rules from Okta (${{ inputs.environment }})" -m "Imported ${{ steps.import.outputs.rule_count }} risk rules"
+
+          git push
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: import-risk-rules-${{ inputs.environment }}-${{ github.run_number }}
+          path: |
+            import.log
+            environments/${{ inputs.environment }}/config/risk_rules.json
+          retention-days: 90
+
+      - name: Post summary
+        if: always()
+        run: |
+          echo "## Risk Rules Import Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment:** ${{ inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Filter:** ${{ github.event.inputs.filter || 'None (all rules)' }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ steps.import.outputs.import_status }}" -eq 0 ]; then
+            echo "**Status:** ✅ Import completed successfully" >> $GITHUB_STEP_SUMMARY
+            echo "**Rules Imported:** ${{ steps.import.outputs.rule_count }}" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "**Status:** ❌ Import failed (see log below)" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ steps.changes.outputs.changed }}" == "true" ]; then
+            if [ "${{ github.event.inputs.commit_changes }}" == "true" ]; then
+              echo "**Changes:** Committed to repository" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "**Changes:** Detected but not committed (commit_changes=false)" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "To commit these changes, re-run with commit_changes=true" >> $GITHUB_STEP_SUMMARY
+            fi
+          else
+            echo "**Changes:** No changes detected (config already up-to-date)" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Import Log" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          cat import.log >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ steps.import.outputs.rule_count }}" -gt 0 ]; then
+            echo "### Imported Rules Preview" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo '```json' >> $GITHUB_STEP_SUMMARY
+            jq '.rules[] | {name, type, status: ._metadata.status}' environments/${{ inputs.environment }}/config/risk_rules.json >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi

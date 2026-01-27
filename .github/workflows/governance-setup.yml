@@ -1,0 +1,730 @@
+name: Setup OIG Governance
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        type: choice
+        options:
+          - lowerdecklabs
+          - production
+          - staging
+          - development
+      create_examples:
+        description: 'Create example governance resources'
+        required: false
+        default: true
+        type: boolean
+      validate_only:
+        description: 'Validate only (do not create PR)'
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  setup-governance:
+    name: Setup OIG Governance Resources
+    runs-on: ubuntu-latest
+
+    environment: ${{ inputs.environment }}
+
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: read
+
+    steps:
+      - name: Safety Check
+        run: |
+          echo "=================================================="
+          echo "  OIG GOVERNANCE SETUP"
+          echo "=================================================="
+          echo ""
+          echo "ℹ️  This workflow creates Terraform files for OIG resources"
+          echo "ℹ️  Resources are NOT applied automatically"
+          echo "✅ Creates PR for review before applying"
+          echo "❌ Does NOT modify your Okta tenant directly"
+          echo ""
+          echo "Environment: ${{ inputs.environment }}"
+          echo "Operation: Create OIG governance Terraform files"
+          echo "=================================================="
+          echo ""
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.0
+
+      - name: Set up environment variables
+        env:
+          OKTA_API_TOKEN: ${{ secrets.OKTA_API_TOKEN }}
+          OKTA_ORG_NAME: ${{ secrets.OKTA_ORG_NAME }}
+          OKTA_BASE_URL: ${{ secrets.OKTA_BASE_URL }}
+        run: |
+          echo "OKTA_ORG_NAME=${OKTA_ORG_NAME}" >> $GITHUB_ENV
+          echo "OKTA_BASE_URL=${OKTA_BASE_URL}" >> $GITHUB_ENV
+          echo "OKTA_API_TOKEN=${OKTA_API_TOKEN}" >> $GITHUB_ENV
+          echo "Configured for org: ${OKTA_ORG_NAME}"
+
+      - name: Verify API access (read-only)
+        run: |
+          echo "Testing API access..."
+          RESPONSE=$(curl -s -w "%{http_code}" \
+            -H "Authorization: SSWS ${OKTA_API_TOKEN}" \
+            -H "Accept: application/json" \
+            "https://${OKTA_ORG_NAME}.${OKTA_BASE_URL}/api/v1/users?limit=1")
+
+          HTTP_CODE="${RESPONSE: -3}"
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "❌ API authentication failed (HTTP $HTTP_CODE)"
+            exit 1
+          fi
+          echo "✅ API access confirmed"
+
+      - name: Create governance directory structure
+        run: |
+          echo "Creating governance directory structure..."
+          mkdir -p environments/${{ inputs.environment }}/terraform/governance
+
+          echo "✅ Directory structure created"
+          tree environments/${{ inputs.environment }}/terraform/governance || ls -la environments/${{ inputs.environment }}/terraform/governance
+
+      - name: Create governance README
+        run: |
+          cat > environments/${{ inputs.environment }}/terraform/governance/README.md <<'EOF'
+          # OIG Governance Resources
+
+          This directory contains Terraform configurations for Okta Identity Governance (OIG) resources.
+
+          ## 🎯 What's Included
+
+          OIG resources introduced in Terraform Okta Provider v6.1.0+:
+
+          ### Access Certification
+          - **Access Reviews (Campaigns)** - `okta_reviews`
+            - Periodic access certification campaigns
+            - Review user entitlements and group memberships
+
+          ### Entitlements
+          - **Principal Entitlements** - `okta_principal_entitlements`
+            - ⚠️ **MANUAL ENTITLEMENTS ONLY**
+            - Cannot manage app-managed entitlements (Salesforce, Workday, etc.)
+            - Use API exports to document app-managed entitlements
+
+          ### Access Request Management
+          - **Request Conditions** - `okta_request_conditions`
+          - **Request Sequences** - `okta_request_sequences`
+          - **Request Settings** - `okta_request_settings`
+          - **Programmatic Requests** - `okta_request_v2`
+
+          ### Resource Catalog
+          - **Catalog Entries** - `okta_catalog_entry_default`
+          - **Custom Request Fields** - `okta_catalog_entry_user_access_request_fields`
+
+          ### Administration
+          - **Resource Sets** - `okta_resource_set`
+            - For delegated administration
+            - Assign specific resources to admin roles
+
+          ## ⚠️ Important Distinctions
+
+          ### Entitlements: Manual vs App-Managed
+
+          | Type | Terraform Support | Example | Identification |
+          |------|-------------------|---------|----------------|
+          | **Manual/Custom (BYO)** | ✅ YES | Custom access bundles | `_category: "manual"` in exports |
+          | **App-Managed (Synced)** | ❌ NO (read-only) | Salesforce profiles | `_category: "app-managed"` in exports |
+
+          **How to identify:**
+          1. Run the OIG export workflow
+          2. Check `../../imports/oig/latest.json`
+          3. Look at the `_category` field for each entitlement
+
+          ## 📋 Prerequisites
+
+          Before creating OIG resources, ensure:
+
+          1. **OIG is enabled** in your Okta tenant
+          2. **Entitlement Management enabled** for apps (if using entitlements)
+             - See `../../../OIG_PREREQUISITES.md` for detailed setup
+          3. **API token has governance scopes**
+          4. **Provider version is v6.1.0+** (check `../provider.tf`)
+
+          ## 🚀 Usage
+
+          ### Creating Resources
+
+          1. **Copy examples** from example files below
+          2. **Create resource files** in this directory
+          3. **Validate** the configuration
+          4. **Plan** to review changes
+          5. **Apply** after review
+
+          ```bash
+          # From this directory
+          cd environments/${{ inputs.environment }}/terraform/governance/
+
+          # Validate
+          terraform validate
+
+          # Plan
+          terraform plan
+
+          # Apply (after review)
+          terraform apply
+          ```
+
+          ### Example: Create Manual Entitlement
+
+          ```hcl
+          # entitlements.tf
+          resource "okta_principal_entitlements" "custom_admin_bundle" {
+            # Note: Exact schema depends on provider version
+            # Check official docs for current schema
+
+            # Only manual/custom entitlements
+            # App-managed entitlements are read-only
+          }
+          ```
+
+          ### Example: Create Access Review Campaign
+
+          ```hcl
+          # reviews.tf
+          resource "okta_reviews" "quarterly_review" {
+            name        = "Q1 2025 Access Review"
+            description = "Quarterly access certification"
+            # Additional configuration...
+          }
+          ```
+
+          ## 📚 Resources
+
+          - **OIG Prerequisites:** `../../../OIG_PREREQUISITES.md`
+          - **API Exports:** `../../imports/oig/` (for app-managed entitlements)
+          - **Official Docs:** https://registry.terraform.io/providers/okta/okta/latest/docs
+
+          ## 🔧 Directory Structure
+
+          ```
+          governance/
+          ├── README.md                    # This file
+          ├── entitlements.tf             # Manual entitlements
+          ├── reviews.tf                  # Access certification campaigns
+          ├── requests.tf                 # Access request workflows
+          ├── catalog.tf                  # Resource catalog
+          ├── resource_sets.tf            # Resource sets for admin roles
+          └── variables.tf                # Governance-specific variables (if needed)
+          ```
+
+          ## ⚠️ Important Notes
+
+          ### State Management
+
+          This directory shares the same state file as the parent terraform directory. All resources are managed together.
+
+          ### Manual Entitlements Only
+
+          The `okta_principal_entitlements` resource can ONLY manage manual/custom entitlements. App-managed entitlements (synced from Salesforce, Workday, etc.) are:
+          - ❌ **Cannot be created** in Terraform
+          - ❌ **Cannot be modified** in Terraform
+          - ✅ **Can be documented** via API exports (`../../imports/oig/`)
+
+          ### Resource Categorization
+
+          Use the OIG export workflow to categorize entitlements:
+          - Exports include `_category` field
+          - `"manual"` → Can be managed in Terraform
+          - `"app-managed"` → Read-only, API export only
+
+          ## 🆘 Troubleshooting
+
+          ### "Resource not found" errors
+          - Ensure OIG is enabled in your tenant
+          - Check API token has governance scopes
+          - Verify provider version is v6.1.0+
+
+          ### "Cannot manage app-managed entitlement"
+          - You can only manage manual/custom entitlements
+          - App-managed entitlements are read-only
+          - Use API exports for documentation
+
+          ### Schema/attribute errors
+          - OIG resources are new in v6.1.0
+          - Schema may evolve in future versions
+          - Check official documentation for current schema
+
+          ---
+
+          Last updated: 2025-11-07
+          EOF
+
+          echo "✅ Governance README created"
+
+      - name: Create example governance resources
+        if: ${{ inputs.create_examples }}
+        run: |
+          echo "Creating example governance resource files..."
+
+          # Create entitlements example (commented out)
+          cat > environments/${{ inputs.environment }}/terraform/governance/entitlements.tf <<'EOF'
+          # =============================================================================
+          # MANUAL ENTITLEMENTS
+          # =============================================================================
+          #
+          # ⚠️ IMPORTANT: This resource can ONLY manage MANUAL/CUSTOM entitlements
+          #
+          # - ✅ Manual/Custom (BYO) entitlements - Can be managed here
+          # - ❌ App-managed entitlements (Salesforce, Workday, etc.) - READ-ONLY
+          #
+          # To identify which entitlements are manual:
+          # 1. Run the OIG export workflow
+          # 2. Check ../../imports/oig/latest.json
+          # 3. Look for "_category": "manual"
+          #
+          # =============================================================================
+
+          # Example: Custom access bundle (manual entitlement)
+          # Uncomment and customize when ready to create
+
+          # resource "okta_principal_entitlements" "custom_access_bundle" {
+          #   # Note: Schema may vary by provider version
+          #   # Check official docs for current attributes:
+          #   # https://registry.terraform.io/providers/okta/okta/latest/docs/resources/principal_entitlements
+          #
+          #   # Example configuration (adjust based on actual schema):
+          #   # name        = "Custom Access Bundle"
+          #   # description = "Manually managed entitlement for special access"
+          #   # principals  = [...]
+          #   # resources   = [...]
+          # }
+
+          # =============================================================================
+          # REFERENCE: App-Managed Entitlements (READ-ONLY)
+          # =============================================================================
+          #
+          # App-managed entitlements CANNOT be created here. They are:
+          # - Synced from provisioning-enabled applications (Salesforce, Workday, etc.)
+          # - Read-only - structure and values controlled by the app
+          # - Documented in: ../../imports/oig/latest.json
+          #
+          # To view app-managed entitlements:
+          # cat ../../imports/oig/latest.json | \
+          #   jq '.entitlements[] | select(._category == "app-managed")'
+          #
+          # =============================================================================
+          EOF
+
+          # Create reviews example (commented out)
+          cat > environments/${{ inputs.environment }}/terraform/governance/reviews.tf <<'EOF'
+          # =============================================================================
+          # ACCESS CERTIFICATION CAMPAIGNS (REVIEWS)
+          # =============================================================================
+          #
+          # Access reviews (campaigns) for periodic access certification.
+          # Review user entitlements, group memberships, and application access.
+          #
+          # Documentation: https://registry.terraform.io/providers/okta/okta/latest/docs/resources/reviews
+          #
+          # =============================================================================
+
+          # Example: Quarterly access review
+          # Uncomment and customize when ready to create
+
+          # resource "okta_reviews" "quarterly_access_review" {
+          #   # Note: Schema may vary by provider version
+          #   # Check official docs for current attributes
+          #
+          #   # Example configuration (adjust based on actual schema):
+          #   # name        = "Q1 2025 Access Review"
+          #   # description = "Quarterly review of user access and entitlements"
+          #   # start_date  = "2025-01-01"
+          #   # end_date    = "2025-03-31"
+          #   #
+          #   # Additional configuration for:
+          #   # - Reviewers
+          #   # - Resources to review
+          #   # - Notification settings
+          #   # - Review schedule
+          # }
+
+          # Example: Manager-driven access review
+          # resource "okta_reviews" "manager_review" {
+          #   # Managers review their direct reports' access
+          # }
+
+          # =============================================================================
+          EOF
+
+          # Create requests example (commented out)
+          cat > environments/${{ inputs.environment }}/terraform/governance/requests.tf <<'EOF'
+          # =============================================================================
+          # ACCESS REQUEST MANAGEMENT
+          # =============================================================================
+          #
+          # Configure access request workflows, approval sequences, and conditions.
+          #
+          # Available resources:
+          # - okta_request_conditions - Conditions for access requests
+          # - okta_request_sequences - Multi-stage approval workflows
+          # - okta_request_settings - Global request settings
+          # - okta_request_v2 - Programmatic access requests
+          #
+          # =============================================================================
+
+          # Example: Request approval sequence
+          # Uncomment and customize when ready to create
+
+          # resource "okta_request_sequences" "manager_approval" {
+          #   # Multi-stage approval workflow
+          #   # Example: Manager approval → Security team approval
+          # }
+
+          # Example: Request conditions
+          # resource "okta_request_conditions" "require_justification" {
+          #   # Require business justification for access requests
+          # }
+
+          # Example: Global request settings
+          # resource "okta_request_settings" "org_settings" {
+          #   # Configure request expiration, notifications, etc.
+          # }
+
+          # =============================================================================
+          EOF
+
+          # Create catalog example (commented out)
+          cat > environments/${{ inputs.environment }}/terraform/governance/catalog.tf <<'EOF'
+          # =============================================================================
+          # RESOURCE CATALOG
+          # =============================================================================
+          #
+          # Make resources (apps, groups, entitlements) requestable through
+          # the self-service access request portal.
+          #
+          # Available resources:
+          # - okta_catalog_entry_default - Make resources requestable
+          # - okta_catalog_entry_user_access_request_fields - Custom request fields
+          #
+          # =============================================================================
+
+          # Example: Make an app requestable
+          # Uncomment and customize when ready to create
+
+          # resource "okta_catalog_entry_default" "salesforce_requestable" {
+          #   # Make Salesforce app requestable
+          #   # Users can request access through self-service portal
+          # }
+
+          # Example: Custom request fields
+          # resource "okta_catalog_entry_user_access_request_fields" "justification" {
+          #   # Add custom fields to request form
+          #   # Example: Business justification, manager email, etc.
+          # }
+
+          # =============================================================================
+          EOF
+
+          # Create resource sets example (commented out)
+          cat > environments/${{ inputs.environment }}/terraform/governance/resource_sets.tf <<'EOF'
+          # =============================================================================
+          # RESOURCE SETS (Delegated Administration)
+          # =============================================================================
+          #
+          # Resource sets for delegated administration.
+          # Assign specific resources to custom admin roles.
+          #
+          # Documentation: https://registry.terraform.io/providers/okta/okta/latest/docs/resources/resource_set
+          #
+          # =============================================================================
+
+          # Example: HR admin resource set
+          # Uncomment and customize when ready to create
+
+          # resource "okta_resource_set" "hr_admin_resources" {
+          #   label       = "HR Admin Resources"
+          #   description = "Resources for HR administrators"
+          #   resources   = [
+          #     # List of resource ORNs that HR admins can manage
+          #     # Example: specific groups, users, etc.
+          #   ]
+          # }
+
+          # Example: App admin resource set
+          # resource "okta_resource_set" "app_admin_resources" {
+          #   label       = "Application Admin Resources"
+          #   description = "Resources for application administrators"
+          #   resources   = [
+          #     # List of app-specific resources
+          #   ]
+          # }
+
+          # =============================================================================
+          EOF
+
+          echo "✅ Example governance resource files created"
+          echo ""
+          echo "Files created:"
+          ls -la environments/${{ inputs.environment }}/terraform/governance/*.tf
+
+      - name: Validate Terraform configuration
+        run: |
+          echo "Validating Terraform configuration..."
+          cd environments/${{ inputs.environment }}/terraform
+
+          terraform init
+          terraform validate
+
+          echo "✅ Terraform configuration is valid"
+
+      - name: Generate setup summary
+        id: summary
+        run: |
+          echo "Generating setup summary..."
+
+          SUMMARY_FILE="environments/${{ inputs.environment }}/terraform/governance/SETUP_SUMMARY.md"
+
+          cat > ${SUMMARY_FILE} <<EOF
+          # OIG Governance Setup Summary
+
+          **Date:** $(date)
+          **Environment:** ${{ inputs.environment }}
+          **Okta Org:** ${OKTA_ORG_NAME}
+          **Workflow Run:** #${{ github.run_number }}
+
+          ## ✅ Setup Complete
+
+          The OIG governance directory structure has been created with example resource files.
+
+          ### Files Created
+
+          \`\`\`
+          environments/${{ inputs.environment }}/terraform/governance/
+          ├── README.md                # Complete governance documentation
+          ├── entitlements.tf         # Manual entitlements (examples commented out)
+          ├── reviews.tf              # Access certification campaigns
+          ├── requests.tf             # Access request workflows
+          ├── catalog.tf              # Resource catalog
+          └── resource_sets.tf        # Resource sets for admin roles
+          \`\`\`
+
+          ### What's Included
+
+          ✅ **Directory structure** for OIG resources
+          ✅ **Comprehensive README** with usage instructions
+          ✅ **Example resource files** (all commented out)
+          ✅ **Documentation** for each resource type
+          ✅ **Important distinctions** (manual vs app-managed entitlements)
+
+          ## 🎯 Next Steps
+
+          ### 1. Review Example Files
+
+          All example resources are **commented out** by default. Review each file:
+          - \`entitlements.tf\` - Manual entitlements only
+          - \`reviews.tf\` - Access certification campaigns
+          - \`requests.tf\` - Access request workflows
+          - \`catalog.tf\` - Resource catalog configuration
+          - \`resource_sets.tf\` - Delegated administration
+
+          ### 2. Identify Manual Entitlements
+
+          Before creating entitlements, identify which are manual vs app-managed:
+
+          \`\`\`bash
+          # Run OIG export workflow or use existing export
+          cat ../../imports/oig/latest.json | \\
+            jq '.entitlements[] | select(._category == "manual") | {name, id}'
+          \`\`\`
+
+          ### 3. Create Your First Resource
+
+          Uncomment an example and customize:
+
+          \`\`\`bash
+          cd environments/${{ inputs.environment }}/terraform/governance
+
+          # Edit the file (uncomment and customize)
+          nano reviews.tf
+
+          # Validate
+          terraform validate
+
+          # Plan
+          terraform plan
+
+          # Apply (after review)
+          terraform apply
+          \`\`\`
+
+          ### 4. Reference Documentation
+
+          - **Prerequisites:** \`../../../OIG_PREREQUISITES.md\`
+          - **Official docs:** https://registry.terraform.io/providers/okta/okta/latest/docs
+
+          ## ⚠️ Important Reminders
+
+          ### Manual vs App-Managed Entitlements
+
+          - ✅ **Manual entitlements** - Can be managed in Terraform
+          - ❌ **App-managed entitlements** - READ-ONLY (Salesforce, Workday, etc.)
+
+          Use the \`_category\` field in OIG exports to identify which is which.
+
+          ### State Management
+
+          All governance resources share the same Terraform state as the parent directory. They're managed together.
+
+          ### No Automatic Apply
+
+          This workflow does NOT apply changes automatically. All resources are:
+          - Created as commented examples
+          - Validated for syntax
+          - Require manual review and apply
+
+          ## 📚 Additional Resources
+
+          - **OIG Export:** \`../../imports/oig/latest.json\`
+          - **Categorized Entitlements:** See \`_category\` field in exports
+          - **Workflows:** \`.github/workflows/\`
+
+          ---
+
+          **Workflow:** OIG Governance Setup
+          **Run ID:** ${{ github.run_id }}
+          **Triggered by:** ${{ github.actor }}
+          EOF
+
+          echo "summary_created=true" >> $GITHUB_OUTPUT
+          echo "✅ Setup summary created"
+
+      - name: Create PR with governance setup
+        if: ${{ !inputs.validate_only }}
+        uses: peter-evans/create-pull-request@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: |
+            feat(governance): Add OIG governance directory structure for ${{ inputs.environment }}
+
+            - Create governance/ directory for OIG resources
+            - Add comprehensive README with usage instructions
+            - Include example files for all OIG resource types
+            - Add important distinctions (manual vs app-managed entitlements)
+            - All examples are commented out (no resources created)
+
+            Next steps:
+            1. Review example files in environments/${{ inputs.environment }}/terraform/governance/
+            2. Identify manual entitlements using OIG exports
+            3. Uncomment and customize resources as needed
+            4. Validate → Plan → Apply
+          branch: governance-setup-${{ inputs.environment }}
+          delete-branch: true
+          title: "feat(governance): Setup OIG governance directory for ${{ inputs.environment }}"
+          body: |
+            ## 🎯 OIG Governance Setup
+
+            This PR creates the directory structure and example files for managing Okta Identity Governance (OIG) resources with Terraform.
+
+            **Environment:** ${{ inputs.environment }}
+
+            ### What's Included
+
+            - ✅ `environments/${{ inputs.environment }}/terraform/governance/` directory
+            - ✅ Comprehensive README with usage instructions
+            - ✅ Example files for all OIG resource types (commented out)
+            - ✅ Documentation for manual vs app-managed entitlements
+            - ✅ References to complete resource examples
+
+            ### Files Created
+
+            ```
+            environments/${{ inputs.environment }}/terraform/governance/
+            ├── README.md
+            ├── entitlements.tf
+            ├── reviews.tf
+            ├── requests.tf
+            ├── catalog.tf
+            └── resource_sets.tf
+            ```
+
+            ### Important Notes
+
+            ⚠️ **All examples are COMMENTED OUT** - No resources will be created by merging this PR.
+
+            ⚠️ **Manual entitlements only** - The `okta_principal_entitlements` resource can ONLY manage manual/custom entitlements. App-managed entitlements (Salesforce, Workday, etc.) are read-only.
+
+            ### Next Steps After Merge
+
+            1. Review example files in `environments/${{ inputs.environment }}/terraform/governance/`
+            2. Identify manual entitlements using OIG exports (`environments/${{ inputs.environment }}/imports/oig/latest.json`)
+            3. Uncomment and customize resources as needed
+            4. Run: `terraform validate` → `terraform plan` → `terraform apply`
+
+            ### Resources
+
+            - Prerequisites: `OIG_PREREQUISITES.md`
+
+            ---
+          labels: |
+            enhancement
+            governance
+            ${{ inputs.environment }}
+
+      - name: Post summary to workflow
+        if: always()
+        run: |
+          echo "## 🎯 OIG Governance Setup" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment:** ${{ inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Operation:** Setup OIG Governance Directory" >> $GITHUB_STEP_SUMMARY
+          echo "**Date:** $(date)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### ✅ Setup Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Created governance directory structure with example files for:" >> $GITHUB_STEP_SUMMARY
+          echo "- Manual entitlements (BYO)" >> $GITHUB_STEP_SUMMARY
+          echo "- Access certification campaigns" >> $GITHUB_STEP_SUMMARY
+          echo "- Access request workflows" >> $GITHUB_STEP_SUMMARY
+          echo "- Resource catalog" >> $GITHUB_STEP_SUMMARY
+          echo "- Resource sets (delegated admin)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### ⚠️ Important" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- All examples are COMMENTED OUT" >> $GITHUB_STEP_SUMMARY
+          echo "- No resources were created" >> $GITHUB_STEP_SUMMARY
+          echo "- Manual entitlements ONLY (no app-managed)" >> $GITHUB_STEP_SUMMARY
+          echo "- Review and customize before applying" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📦 Next Steps" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "1. Review PR and merge" >> $GITHUB_STEP_SUMMARY
+          echo "2. Identify manual entitlements in imports/oig/" >> $GITHUB_STEP_SUMMARY
+          echo "3. Uncomment and customize resources" >> $GITHUB_STEP_SUMMARY
+          echo "4. Validate → Plan → Apply" >> $GITHUB_STEP_SUMMARY
+
+      - name: Final check
+        if: always()
+        run: |
+          echo ""
+          echo "=================================================="
+          echo "  OIG GOVERNANCE SETUP COMPLETED"
+          echo "=================================================="
+          echo ""
+          echo "✅ Directory structure created"
+          echo "✅ Example files added (commented out)"
+          echo "✅ Comprehensive documentation included"
+          if [ "${{ inputs.validate_only }}" = "true" ]; then
+            echo "ℹ️  Validate-only mode - No PR created"
+          else
+            echo "✅ PR created for review"
+          fi
+          echo ""
+          echo "Review the PR and merge to enable OIG governance management."
+          echo "=================================================="

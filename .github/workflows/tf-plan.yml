@@ -1,0 +1,240 @@
+name: Terraform Plan - MyOrg
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to plan'
+        required: true
+        default: 'myorg'
+        type: choice
+        options:
+          - myorg
+          - production
+          - staging
+          - development
+  push:
+    branches:
+      - main
+    paths:
+      - 'environments/*/terraform/**'
+      - '.github/workflows/terraform-plan.yml'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'environments/*/terraform/**'
+      - '.github/workflows/terraform-plan.yml'
+
+permissions:
+  contents: read
+  pull-requests: write
+  id-token: write  # Required for AWS OIDC
+
+jobs:
+  detect-environment:
+    name: Detect Environment
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.detect-env.outputs.environment }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Detect Environment
+        id: detect-env
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "environment=${{ inputs.environment }}" >> $GITHUB_OUTPUT
+          else
+            # Dynamically extract environment from changed files
+            # Get the first environment directory that has terraform changes
+            if [ "${{ github.event_name }}" == "pull_request" ]; then
+              CHANGED_FILES=$(git diff --name-only ${{ github.event.pull_request.base.sha }} ${{ github.sha }})
+            else
+              CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD)
+            fi
+
+            # Extract environment name from path: environments/{env}/terraform/
+            ENV_NAME=$(echo "$CHANGED_FILES" | grep "^environments/.*/terraform/" | head -1 | sed 's|environments/\([^/]*\)/terraform/.*|\1|')
+
+            if [ -n "$ENV_NAME" ]; then
+              echo "Detected environment: $ENV_NAME"
+              echo "environment=$ENV_NAME" >> $GITHUB_OUTPUT
+            else
+              echo "No environment detected from changed files, using default"
+              echo "environment=myorg" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+  terraform-plan:
+    name: Terraform Plan
+    needs: detect-environment
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ needs.detect-environment.outputs.environment }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set Environment Variable
+        id: detect-env
+        run: |
+          echo "environment=${{ needs.detect-environment.outputs.environment }}" >> $GITHUB_OUTPUT
+
+      - name: Configure AWS Credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: GitHubActions-TerraformPlan-${{ steps.detect-env.outputs.environment }}
+          aws-region: us-east-1
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.0"
+
+      - name: Configure Terraform variables
+        working-directory: environments/${{ steps.detect-env.outputs.environment }}/terraform
+        run: |
+          cat > terraform.tfvars << EOF
+          okta_org_name  = "${{ secrets.OKTA_ORG_NAME }}"
+          okta_base_url  = "${{ secrets.OKTA_BASE_URL }}"
+          okta_api_token = "${{ secrets.OKTA_API_TOKEN }}"
+          EOF
+
+      - name: Terraform Init
+        working-directory: environments/${{ steps.detect-env.outputs.environment }}/terraform
+        run: terraform init -upgrade
+
+      - name: Terraform Validate
+        working-directory: environments/${{ steps.detect-env.outputs.environment }}/terraform
+        run: terraform validate
+
+      - name: Terraform Format Check
+        working-directory: environments/${{ steps.detect-env.outputs.environment }}/terraform
+        run: terraform fmt -check -recursive || echo "Warning Format check failed"
+
+      - name: Terraform Plan
+        id: plan
+        working-directory: environments/${{ steps.detect-env.outputs.environment }}/terraform
+        run: |
+          terraform plan -no-color -out=tfplan
+          terraform show -no-color tfplan > plan_output.txt
+        continue-on-error: true
+
+      - name: Display Plan Summary
+        working-directory: environments/${{ steps.detect-env.outputs.environment }}/terraform
+        run: |
+          echo "## Terraform Plan Summary"
+          echo ""
+          if [ -f plan_output.txt ]; then
+            # Extract summary
+            echo "### Changes"
+            grep -A 20 "Terraform will perform" plan_output.txt || echo "No changes detected"
+            echo ""
+            echo "### Resource Counts"
+            grep "Plan:" plan_output.txt || grep "No changes" plan_output.txt || echo "See full output below"
+          fi
+
+      - name: Check for Campaign Association Errors
+        if: steps.plan.outcome == 'failure'
+        working-directory: environments/${{ steps.detect-env.outputs.environment }}/terraform
+        run: |
+          if [ -f plan_output.txt ] && grep -q "Error reading campaign" plan_output.txt; then
+            echo "::error::Detected entitlement bundle campaign association errors"
+            echo ""
+            echo "## ⚠️ Campaign Association Errors Detected" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Some entitlement bundles have stale campaign associations from deleted access review campaigns." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### How to Fix:" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Run the fix workflow:" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
+            echo "gh workflow run fix-bundle-campaign-errors.yml -f dry_run=false -f bundles_to_fix=all_13" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Or manually via GitHub Actions UI:" >> $GITHUB_STEP_SUMMARY
+            echo "1. Go to Actions → Fix Entitlement Bundle Campaign Errors" >> $GITHUB_STEP_SUMMARY
+            echo "2. Click 'Run workflow'" >> $GITHUB_STEP_SUMMARY
+            echo "3. Select bundles_to_fix: **all_13**" >> $GITHUB_STEP_SUMMARY
+            echo "4. Set dry_run: **false**" >> $GITHUB_STEP_SUMMARY
+            echo "5. Click 'Run workflow'" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### More Information:" >> $GITHUB_STEP_SUMMARY
+            echo "See [\`docs/TROUBLESHOOTING_ENTITLEMENT_BUNDLES.md\`](../blob/main/docs/TROUBLESHOOTING_ENTITLEMENT_BUNDLES.md) for details." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### Affected Bundles:" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+            grep -B 2 "Error reading campaign" plan_output.txt | grep "okta_entitlement_bundle" | sed 's/^.*okta_entitlement_bundle\./- /' | sed 's/,$//' >> $GITHUB_STEP_SUMMARY || true
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+
+            # Set output for later steps
+            echo "campaign_errors=true" >> $GITHUB_OUTPUT
+          else
+            echo "campaign_errors=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Upload Plan
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: terraform-plan-${{ steps.detect-env.outputs.environment }}
+          path: |
+            environments/${{ steps.detect-env.outputs.environment }}/terraform/tfplan
+            environments/${{ steps.detect-env.outputs.environment }}/terraform/plan_output.txt
+          retention-days: 30
+
+      - name: Comment PR with Plan
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const planOutput = fs.readFileSync('environments/${{ steps.detect-env.outputs.environment }}/terraform/plan_output.txt', 'utf8');
+
+            const output = `## Terraform Plan Results
+
+            <details>
+            <summary>Show Plan</summary>
+
+            \`\`\`terraform
+            ${planOutput}
+            \`\`\`
+
+            </details>
+
+            *Environment: ${{ steps.detect-env.outputs.environment }}*
+            `;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            });
+
+      - name: Plan Status
+        if: steps.plan.outcome == 'failure'
+        run: |
+          echo "❌ Terraform plan failed"
+          exit 1
+
+      - name: Cleanup sensitive files
+        if: always()
+        working-directory: environments/${{ steps.detect-env.outputs.environment }}/terraform
+        run: |
+          rm -f terraform.tfvars
+          rm -f tfplan
+
+      - name: Plan Success
+        if: steps.plan.outcome == 'success'
+        run: |
+          echo "✅ Terraform plan completed successfully"
+          echo "Download the plan artifact to review details"

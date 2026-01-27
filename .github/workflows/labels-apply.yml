@@ -1,0 +1,245 @@
+name: Apply Labels
+
+on:
+  workflow_dispatch:
+    inputs:
+      label_type:
+        description: 'Type of labels to apply'
+        required: true
+        type: choice
+        options:
+          - all
+          - admin
+      environment:
+        description: 'Target environment'
+        required: true
+        type: string
+      dry_run:
+        description: 'Dry run mode (preview changes without applying)'
+        required: false
+        default: true
+        type: boolean
+
+jobs:
+  apply-labels:
+    name: Apply ${{ inputs.label_type }} Labels
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+
+    permissions:
+      contents: write
+      actions: read
+
+    steps:
+      - name: Workflow Overview
+        run: |
+          echo "=================================================="
+          echo "  APPLY LABELS"
+          echo "=================================================="
+          echo ""
+          echo "Environment: ${{ inputs.environment }}"
+          echo "Label Type: ${{ inputs.label_type }}"
+          if [ "${{ inputs.dry_run }}" == "true" ]; then
+            echo "Mode: DRY RUN (preview only, no changes)"
+          else
+            echo "Mode: APPLY (will modify Okta resources)"
+          fi
+          echo "=================================================="
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Set up environment variables
+        env:
+          OKTA_API_TOKEN: ${{ secrets.OKTA_API_TOKEN }}
+          OKTA_ORG_NAME: ${{ secrets.OKTA_ORG_NAME }}
+          OKTA_BASE_URL: ${{ secrets.OKTA_BASE_URL }}
+        run: |
+          echo "OKTA_ORG_NAME=${OKTA_ORG_NAME}" >> $GITHUB_ENV
+          echo "OKTA_BASE_URL=${OKTA_BASE_URL}" >> $GITHUB_ENV
+          echo "OKTA_API_TOKEN=${OKTA_API_TOKEN}" >> $GITHUB_ENV
+          echo "Configured for org: ${OKTA_ORG_NAME}"
+
+      - name: Verify API access
+        run: |
+          echo "Testing API access..."
+          RESPONSE=$(curl -s -w "%{http_code}" -H "Authorization: SSWS ${OKTA_API_TOKEN}" -H "Accept: application/json" "https://${OKTA_ORG_NAME}.${OKTA_BASE_URL}/api/v1/users?limit=1")
+          HTTP_CODE="${RESPONSE: -3}"
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "API authentication failed"
+            exit 1
+          fi
+          echo "API access confirmed"
+
+      # ========================================
+      # ALL LABELS (OIG Labels from config)
+      # ========================================
+      - name: Scan Terraform for admin resources
+        if: inputs.label_type == 'all'
+        run: |
+          echo "Scanning Terraform configurations for admin resources..."
+          python3 scripts/find_admin_resources.py --config-dir environments/${{ inputs.environment }}/terraform --json > admin_resources.json
+          echo "Admin resources scan complete"
+          cat admin_resources.json | jq '.'
+
+      - name: Display label configuration
+        if: inputs.label_type == 'all'
+        run: |
+          echo "Current label configuration:"
+          cat environments/${{ inputs.environment }}/config/api_config.json | jq '.labels.assignments'
+
+      - name: Apply OIG labels (or dry run)
+        if: inputs.label_type == 'all'
+        id: apply_oig_labels
+        continue-on-error: true
+        run: |
+          echo "Starting OIG label application..."
+          if [ "${{ inputs.dry_run }}" == "true" ]; then
+            echo "DRY RUN MODE - Would apply the following labels:"
+            cat environments/${{ inputs.environment }}/config/api_config.json | jq '.labels'
+            echo "apply_status=dry_run_success" >> $GITHUB_OUTPUT
+          else
+            chmod +x scripts/okta_api_manager.py
+            python3 scripts/okta_api_manager.py --action apply --config environments/${{ inputs.environment }}/config/api_config.json 2>&1 | tee apply.log
+            APPLY_STATUS=$?
+            if [ $APPLY_STATUS -eq 0 ]; then
+              echo "apply_status=success" >> $GITHUB_OUTPUT
+              echo "Labels applied successfully"
+            else
+              echo "apply_status=failed" >> $GITHUB_OUTPUT
+              echo "Label application failed or completed with warnings"
+            fi
+          fi
+
+      - name: Export labels for verification
+        if: inputs.label_type == 'all' && inputs.dry_run == false
+        id: export_labels
+        continue-on-error: true
+        run: |
+          echo "Exporting labels for verification..."
+          python3 scripts/okta_api_manager.py --action export --export-labels --org-name "${OKTA_ORG_NAME}" --base-url "${OKTA_BASE_URL}" --api-token "${OKTA_API_TOKEN}" --output labels_verification.json 2>&1 | tee export.log
+          if [ -f "labels_verification.json" ]; then
+            LABELS_COUNT=$(jq '.labels | length // 0' labels_verification.json)
+            echo "labels_count=$LABELS_COUNT" >> $GITHUB_OUTPUT
+            echo "Labels exported: $LABELS_COUNT"
+          else
+            echo "labels_count=0" >> $GITHUB_OUTPUT
+          fi
+
+      # ========================================
+      # ADMIN LABELS (Privileged entitlements)
+      # ========================================
+      - name: Apply admin labels
+        if: inputs.label_type == 'admin'
+        id: apply_admin_labels
+        run: |
+          chmod +x scripts/apply_admin_labels.py
+
+          if [ "${{ inputs.dry_run }}" == "true" ]; then
+            echo "Running in DRY RUN mode..."
+            python3 scripts/apply_admin_labels.py --dry-run 2>&1 | tee apply.log
+          else
+            echo "Running in APPLY mode..."
+            python3 scripts/apply_admin_labels.py 2>&1 | tee apply.log
+          fi
+
+          APPLY_STATUS=$?
+          echo "apply_status=$APPLY_STATUS" >> $GITHUB_OUTPUT
+
+      - name: Parse admin label results
+        if: inputs.label_type == 'admin'
+        id: admin_results
+        run: |
+          if [ -f "admin_labels_results.json" ]; then
+            BUNDLES_QUERIED=$(jq '.bundles_queried // 0' admin_labels_results.json)
+            ADMIN_FOUND=$(jq '.admin_bundles_found // 0' admin_labels_results.json)
+            LABELS_APPLIED=$(jq '.labels_applied // 0' admin_labels_results.json)
+            LABELS_FAILED=$(jq '.labels_failed // 0' admin_labels_results.json)
+            DRY_RUN=$(jq '.dry_run // false' admin_labels_results.json)
+
+            echo "bundles_queried=$BUNDLES_QUERIED" >> $GITHUB_OUTPUT
+            echo "admin_found=$ADMIN_FOUND" >> $GITHUB_OUTPUT
+            echo "labels_applied=$LABELS_APPLIED" >> $GITHUB_OUTPUT
+            echo "labels_failed=$LABELS_FAILED" >> $GITHUB_OUTPUT
+            echo "dry_run=$DRY_RUN" >> $GITHUB_OUTPUT
+          else
+            echo "bundles_queried=0" >> $GITHUB_OUTPUT
+            echo "admin_found=0" >> $GITHUB_OUTPUT
+            echo "labels_applied=0" >> $GITHUB_OUTPUT
+            echo "labels_failed=0" >> $GITHUB_OUTPUT
+            echo "dry_run=true" >> $GITHUB_OUTPUT
+          fi
+
+      # ========================================
+      # UPLOAD ARTIFACTS
+      # ========================================
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: label-results-${{ inputs.label_type }}-${{ inputs.environment }}-${{ github.run_number }}
+          path: |
+            admin_resources.json
+            apply.log
+            export.log
+            labels_verification.json
+            admin_labels_results.json
+          retention-days: 90
+
+      # ========================================
+      # SUMMARY
+      # ========================================
+      - name: Post summary (all labels)
+        if: inputs.label_type == 'all'
+        run: |
+          echo "## Apply Labels Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment:** ${{ inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Label Type:** All OIG Labels" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ inputs.dry_run }}" == "true" ]; then
+            echo "**Mode:** Dry Run (Preview Only)" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "**Mode:** Apply (Changes Applied)" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Application Status" >> $GITHUB_STEP_SUMMARY
+          echo "**Status:** ${{ steps.apply_oig_labels.outputs.apply_status }}" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ inputs.dry_run }}" == "false" ]; then
+            echo "**Labels Exported:** ${{ steps.export_labels.outputs.labels_count }}" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Post summary (admin labels)
+        if: inputs.label_type == 'admin'
+        run: |
+          echo "## Apply Admin Labels Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment:** ${{ inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Label Type:** Admin/Privileged Entitlements" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ inputs.dry_run }}" == "true" ]; then
+            echo "**Mode:** Dry Run (Preview Only)" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "**Mode:** Apply (Changes Applied)" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Metric | Count |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Entitlement bundles queried | ${{ steps.admin_results.outputs.bundles_queried }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Admin entitlements found | ${{ steps.admin_results.outputs.admin_found }} |" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ inputs.dry_run }}" == "true" ]; then
+            echo "| Labels that would be applied | ${{ steps.admin_results.outputs.admin_found }} |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| Labels applied | ${{ steps.admin_results.outputs.labels_applied }} |" >> $GITHUB_STEP_SUMMARY
+            echo "| Labels failed | ${{ steps.admin_results.outputs.labels_failed }} |" >> $GITHUB_STEP_SUMMARY
+          fi

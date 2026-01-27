@@ -1,0 +1,20 @@
+{
+  "demo_id": "demo-abc123",
+  "user_id": "user-xyz789",
+  "user_email": "john.doe@example.com",
+  "component_id": "component-okta-terraform-gitops",
+  "component_instance_id": "instance-456def",
+  "configuration": {
+    "repo_visibility": "private",
+    "enable_aws_backend": false,
+    "auto_import": true
+  },
+  "okta_org": {
+    "id": "org-123",
+    "name": "acme-demo",
+    "base_url": "oktapreview.com",
+    "api_token": "00mock_token_replace_with_real_for_testing"
+  },
+  "timestamp": "2025-11-19T14:30:00.000Z",
+  "webhook_version": "1.0"
+}

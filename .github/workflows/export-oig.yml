@@ -1,0 +1,206 @@
+name: Export OIG Resources
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        type: choice
+        options:
+          - lowerdecklabs
+          - production
+          - staging
+          - development
+      export_labels:
+        description: 'Export governance labels'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      export_owners:
+        description: 'Export resource owners'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      resource_orns:
+        description: 'Resource ORNs for owner export (space-separated, optional)'
+        required: false
+        type: string
+
+jobs:
+  export-oig:
+    name: Export OIG API-Only Resources
+    runs-on: ubuntu-latest
+
+    environment: ${{ inputs.environment }}
+
+    permissions:
+      contents: write
+      actions: read
+
+    steps:
+      - name: Safety Check
+        run: |
+          echo "=================================================="
+          echo "  OIG EXPORT - READ-ONLY OPERATION"
+          echo "=================================================="
+          echo ""
+          echo "Environment: ${{ inputs.environment }}"
+          echo "Operation: Export OIG API-only resources"
+          echo "Export Labels: ${{ inputs.export_labels }}"
+          echo "Export Owners: ${{ inputs.export_owners }}"
+          echo "Resource ORNs: ${{ inputs.resource_orns || 'N/A' }}"
+          echo "=================================================="
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Set up environment variables
+        env:
+          OKTA_API_TOKEN: ${{ secrets.OKTA_API_TOKEN }}
+          OKTA_ORG_NAME: ${{ secrets.OKTA_ORG_NAME }}
+          OKTA_BASE_URL: ${{ secrets.OKTA_BASE_URL }}
+        run: |
+          echo "OKTA_ORG_NAME=${OKTA_ORG_NAME}" >> $GITHUB_ENV
+          echo "OKTA_BASE_URL=${OKTA_BASE_URL}" >> $GITHUB_ENV
+          echo "OKTA_API_TOKEN=${OKTA_API_TOKEN}" >> $GITHUB_ENV
+          echo "Configured for org: ${OKTA_ORG_NAME}"
+
+      - name: Verify API access
+        run: |
+          echo "Testing API access..."
+          RESPONSE=$(curl -s -w "%{http_code}" -H "Authorization: SSWS ${OKTA_API_TOKEN}" -H "Accept: application/json" "https://${OKTA_ORG_NAME}.${OKTA_BASE_URL}/api/v1/users?limit=1")
+          HTTP_CODE="${RESPONSE: -3}"
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "API authentication failed"
+            exit 1
+          fi
+          echo "API access confirmed"
+
+      - name: Create export directory
+        run: |
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+          echo "EXPORT_DIR=${{ inputs.environment }}_oig_export_${TIMESTAMP}" >> $GITHUB_ENV
+          echo "TIMESTAMP=${TIMESTAMP}" >> $GITHUB_ENV
+          mkdir -p ${{ inputs.environment }}_oig_export_${TIMESTAMP}
+
+      - name: Export OIG resources
+        id: export_oig
+        continue-on-error: true
+        run: |
+          echo "Starting OIG API-only export..."
+          chmod +x scripts/okta_api_manager.py
+
+          # Build command with conditional flags
+          CMD="python3 scripts/okta_api_manager.py --action export --org-name \"${OKTA_ORG_NAME}\" --base-url \"${OKTA_BASE_URL}\" --api-token \"${OKTA_API_TOKEN}\" --output \"${EXPORT_DIR}/${{ inputs.environment }}_oig_export.json\""
+
+          # Add export-labels flag if enabled
+          if [ "${{ inputs.export_labels }}" = "true" ]; then
+            CMD="$CMD --export-labels"
+            echo "Labels export enabled"
+          fi
+
+          # Add export-owners flag if enabled
+          if [ "${{ inputs.export_owners }}" = "true" ]; then
+            CMD="$CMD --export-owners"
+            echo "Resource owners export enabled"
+
+            # Add resource ORNs if provided
+            if [ -n "${{ inputs.resource_orns }}" ]; then
+              CMD="$CMD --resource-orns ${{ inputs.resource_orns }}"
+              echo "Resource ORNs: ${{ inputs.resource_orns }}"
+            fi
+          fi
+
+          # Execute command
+          echo "Running: $CMD"
+          eval "$CMD 2>&1" | tee export.log
+          EXPORT_STATUS=$?
+
+          if [ $EXPORT_STATUS -eq 0 ]; then
+            echo "export_status=success" >> $GITHUB_OUTPUT
+            echo "Export completed successfully"
+          else
+            echo "export_status=partial" >> $GITHUB_OUTPUT
+            echo "Export completed with warnings"
+          fi
+
+      - name: Parse export results
+        id: parse_results
+        run: |
+          EXPORT_FILE="${EXPORT_DIR}/${{ inputs.environment }}_oig_export.json"
+          if [ -f "$EXPORT_FILE" ]; then
+            LABELS_COUNT=$(jq '.labels | length' "$EXPORT_FILE" 2>/dev/null || echo "0")
+            OWNERS_COUNT=$(jq '.resource_owners | length' "$EXPORT_FILE" 2>/dev/null || echo "0")
+            echo "labels_count=$LABELS_COUNT" >> $GITHUB_OUTPUT
+            echo "owners_count=$OWNERS_COUNT" >> $GITHUB_OUTPUT
+            echo "Labels: $LABELS_COUNT"
+            echo "Resource Owners: $OWNERS_COUNT"
+          else
+            echo "labels_count=0" >> $GITHUB_OUTPUT
+            echo "owners_count=0" >> $GITHUB_OUTPUT
+            echo "Export file not found"
+          fi
+
+      - name: Upload export data
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ${{ inputs.environment }}-oig-export-${{ env.TIMESTAMP }}
+          path: |
+            ${{ env.EXPORT_DIR }}/
+            export.log
+          retention-days: 180
+
+      - name: Commit export to repository
+        if: success()
+        run: |
+          EXPORT_DATE=$(date +%Y-%m-%d)
+          EXPORT_FILE="${EXPORT_DIR}/${{ inputs.environment }}_oig_export.json"
+          mkdir -p oig-exports/${{ inputs.environment }}
+          cp "${EXPORT_FILE}" "oig-exports/${{ inputs.environment }}/${EXPORT_DATE}.json"
+          cp "${EXPORT_FILE}" "oig-exports/${{ inputs.environment }}/latest.json"
+          echo "Export files copied"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add oig-exports/${{ inputs.environment }}/
+          if git diff --staged --quiet; then
+            echo "No changes detected"
+          else
+            LABELS_COUNT=$(jq '.labels | length // 0' "${EXPORT_FILE}")
+            OWNERS_COUNT=$(jq '.resource_owners | length // 0' "${EXPORT_FILE}")
+            LABELS_STATUS=$(jq -r '.export_status.labels // "unknown"' "${EXPORT_FILE}")
+            OWNERS_STATUS=$(jq -r '.export_status.resource_owners // "unknown"' "${EXPORT_FILE}")
+            git commit -m "feat(oig): Export OIG (${{ inputs.environment }}) - Labels: ${LABELS_COUNT}, Owners: ${OWNERS_COUNT}"
+            git push
+            echo "Export committed to repository"
+          fi
+
+      - name: Post summary
+        if: always()
+        run: |
+          echo "## OIG API-Only Export Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment:** ${{ inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Operation:** API-Only Export (Read-Only)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Type | Count |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Labels | ${{ steps.parse_results.outputs.labels_count }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Resource Owners | ${{ steps.parse_results.outputs.owners_count }} |" >> $GITHUB_STEP_SUMMARY

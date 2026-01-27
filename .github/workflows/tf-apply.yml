@@ -1,0 +1,182 @@
+name: Terraform Apply (with Approval)
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to apply changes'
+        required: true
+        default: 'myorg'
+        type: choice
+        options:
+          - myorg
+          - production
+          - staging
+          - development
+      plan_artifact:
+        description: 'Plan artifact name (leave empty to generate new plan)'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+
+jobs:
+  approval:
+    name: Request Approval
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ inputs.environment }}-approval
+    steps:
+      - name: Manual Approval Gate
+        run: |
+          echo "=========================================="
+          echo "MANUAL APPROVAL REQUIRED"
+          echo "=========================================="
+          echo ""
+          echo "Environment: ${{ inputs.environment }}"
+          echo ""
+          echo "This step requires manual approval before proceeding."
+          echo "An authorized approver must review and approve this deployment."
+          echo ""
+          echo "After approval, terraform apply will execute automatically."
+
+  terraform-apply:
+    name: Terraform Apply
+    needs: approval
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ inputs.environment }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: GitHubActions-TerraformApply-${{ inputs.environment }}
+          aws-region: us-east-1
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.0"
+
+      - name: Configure Terraform variables
+        working-directory: environments/${{ inputs.environment }}/terraform
+        run: |
+          cat > terraform.tfvars << EOF
+          okta_org_name  = "${{ secrets.OKTA_ORG_NAME }}"
+          okta_base_url  = "${{ secrets.OKTA_BASE_URL }}"
+          okta_api_token = "${{ secrets.OKTA_API_TOKEN }}"
+          EOF
+
+      - name: Terraform Init
+        working-directory: environments/${{ inputs.environment }}/terraform
+        run: terraform init -upgrade
+
+      - name: Download Plan Artifact (if specified)
+        if: inputs.plan_artifact != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.plan_artifact }}
+          path: environments/${{ inputs.environment }}/terraform/
+
+      - name: Generate New Plan (if no artifact)
+        if: inputs.plan_artifact == ''
+        working-directory: environments/${{ inputs.environment }}/terraform
+        run: |
+          echo "No plan artifact specified - generating new plan..."
+          terraform plan -no-color -out=tfplan 2>&1 | tee plan_output.txt
+
+          # Check for changes
+          if grep -q "No changes" plan_output.txt; then
+            echo "no_changes=true" >> $GITHUB_OUTPUT
+            echo ""
+            echo "=========================================="
+            echo "NO CHANGES TO APPLY"
+            echo "=========================================="
+            echo ""
+            echo "Terraform plan shows no changes needed."
+            echo "Your infrastructure matches the configuration."
+            exit 0
+          fi
+
+      - name: Display Plan Before Apply
+        working-directory: environments/${{ inputs.environment }}/terraform
+        run: |
+          echo "=========================================="
+          echo "TERRAFORM PLAN TO BE APPLIED"
+          echo "=========================================="
+          echo ""
+          terraform show -no-color tfplan
+
+      - name: Apply Terraform Changes
+        id: apply
+        working-directory: environments/${{ inputs.environment }}/terraform
+        run: |
+          echo "=========================================="
+          echo "APPLYING TERRAFORM CHANGES"
+          echo "=========================================="
+          echo ""
+          terraform apply -auto-approve tfplan 2>&1 | tee apply_output.txt
+          echo ""
+          echo "=========================================="
+          echo "APPLY COMPLETE"
+          echo "=========================================="
+
+      - name: Upload Apply Output
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: terraform-apply-${{ inputs.environment }}-${{ github.run_number }}
+          path: |
+            environments/${{ inputs.environment }}/terraform/apply_output.txt
+            environments/${{ inputs.environment }}/terraform/plan_output.txt
+          retention-days: 30
+
+      - name: Apply Summary
+        if: success()
+        run: |
+          echo "## Apply Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "✅ Terraform apply succeeded" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment:** ${{ inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Run Number:** ${{ github.run_number }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Review the Okta Admin Console to verify changes." >> $GITHUB_STEP_SUMMARY
+
+      # Note: State is now stored in S3, no need to commit local state files
+      # - name: Commit State Changes
+      #   State is automatically managed in S3 backend
+
+      - name: Cleanup Sensitive Files
+        if: always()
+        working-directory: environments/${{ inputs.environment }}/terraform
+        run: |
+          rm -f terraform.tfvars
+          rm -f tfplan
+          rm -f plan_output.txt
+          rm -f apply_output.txt
+
+      - name: Apply Success
+        if: success()
+        run: |
+          echo "✅ Terraform apply completed successfully"
+          echo ""
+          echo "Changes have been applied to: ${{ inputs.environment }}"
+          echo "Review the Okta Admin Console to verify changes"
+
+      - name: Apply Failure
+        if: failure()
+        run: |
+          echo "❌ Terraform apply failed"
+          echo ""
+          echo "Review the error output above"
+          echo "Download apply artifact for investigation"
+          exit 1

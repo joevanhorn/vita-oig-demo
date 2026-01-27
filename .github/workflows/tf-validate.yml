@@ -1,0 +1,453 @@
+name: Terraform Validation
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'environments/*/terraform/**/*.tf'
+      - '.github/workflows/terraform-validate.yml'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to validate'
+        required: true
+        default: 'myorg'
+        type: choice
+        options:
+          - myorg
+          - production
+          - staging
+          - development
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  detect-environments:
+    name: Detect Changed Environments
+    runs-on: ubuntu-latest
+    outputs:
+      environments: ${{ steps.detect.outputs.environments }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect environments
+        id: detect
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "environments=[\"${{ inputs.environment }}\"]" >> $GITHUB_OUTPUT
+          else
+            # Detect from changed files in PR
+            CHANGED_FILES=$(git diff --name-only origin/main...HEAD | grep "environments/.*/terraform/.*\.tf" || true)
+            if [ -z "$CHANGED_FILES" ]; then
+              echo "environments=[]" >> $GITHUB_OUTPUT
+            else
+              ENVS=$(echo "$CHANGED_FILES" | sed -n 's|environments/\([^/]*\)/terraform/.*|\1|p' | sort -u | jq -R -s -c 'split("\n") | map(select(length > 0))')
+              echo "environments=$ENVS" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+      - name: Display detected environments
+        run: |
+          echo "Environments to validate: ${{ steps.detect.outputs.environments }}"
+
+  validate:
+    name: Validate ${{ matrix.environment }}
+    needs: detect-environments
+    if: needs.detect-environments.outputs.environments != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        environment: ${{ fromJson(needs.detect-environments.outputs.environments) }}
+      fail-fast: false
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.0"
+
+      - name: Terraform Format Check
+        id: fmt
+        working-directory: environments/${{ matrix.environment }}/terraform
+        run: |
+          echo "## Terraform Format Check" >> $GITHUB_STEP_SUMMARY
+          if terraform fmt -check -recursive; then
+            echo "✅ All files are properly formatted" >> $GITHUB_STEP_SUMMARY
+            echo "formatted=true" >> $GITHUB_OUTPUT
+          else
+            echo "❌ Files need formatting. Run: terraform fmt -recursive" >> $GITHUB_STEP_SUMMARY
+            echo "formatted=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+      - name: Terraform Init
+        id: init
+        working-directory: environments/${{ matrix.environment }}/terraform
+        run: |
+          # Initialize without backend for validation
+          terraform init -backend=false
+
+      - name: Terraform Validate
+        id: validate
+        working-directory: environments/${{ matrix.environment }}/terraform
+        run: |
+          echo "## Terraform Validate" >> $GITHUB_STEP_SUMMARY
+          if terraform validate -no-color; then
+            echo "✅ Terraform configuration is valid" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ Terraform validation failed" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+
+      - name: Check for Okta Template String Escaping
+        working-directory: environments/${{ matrix.environment }}/terraform
+        run: |
+          echo "## Template String Validation" >> $GITHUB_STEP_SUMMARY
+
+          # Check for unescaped ${source.* or ${user.* patterns
+          # Exclude properly escaped $${...} patterns by filtering out lines with $$
+          UNESCAPED=$(grep -r '\${source\.' . --include="*.tf" 2>/dev/null | grep -v '\$\${' || true)
+          UNESCAPED+=$(grep -r '\${user\.' . --include="*.tf" 2>/dev/null | grep -v '\$\${' || true)
+
+          if [ -n "$UNESCAPED" ]; then
+            echo "❌ Found unescaped Okta template strings:" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+            echo "$UNESCAPED" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Use \$\${source.login} instead of \${source.login}" >> $GITHUB_STEP_SUMMARY
+            echo "See CLAUDE.md Gotcha #1" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          else
+            echo "✅ All Okta template strings are properly escaped" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Check OAuth App Configuration
+        working-directory: environments/${{ matrix.environment }}/terraform
+        run: |
+          echo "## OAuth App Configuration Validation" >> $GITHUB_STEP_SUMMARY
+
+          # Find okta_app_oauth resources
+          OAUTH_APPS=$(grep -l 'resource "okta_app_oauth"' *.tf 2>/dev/null || true)
+
+          ISSUES=""
+          for file in $OAUTH_APPS; do
+            # Check 1: Visibility requires login_mode
+            if grep -A 20 'hide_ios.*=.*false' "$file" | grep -v 'login_mode' > /dev/null; then
+              ISSUES+="$file: Visible OAuth app (hide_ios=false) missing login_mode\n"
+            fi
+            if grep -A 20 'hide_web.*=.*false' "$file" | grep -v 'login_mode' > /dev/null; then
+              ISSUES+="$file: Visible OAuth app (hide_web=false) missing login_mode\n"
+            fi
+
+            # Check 2: token_endpoint_auth_method="none" requires pkce_required=true
+            if grep -A 30 'token_endpoint_auth_method.*=.*"none"' "$file" > /dev/null; then
+              if ! grep -A 30 'token_endpoint_auth_method.*=.*"none"' "$file" | grep 'pkce_required.*=.*true' > /dev/null; then
+                ISSUES+="$file: token_endpoint_auth_method='none' requires pkce_required=true\n"
+              fi
+            fi
+
+            # Check 3: PKCE required for public clients (native/browser/service)
+            if grep -A 5 'type.*=.*"native\|browser\|service"' "$file" > /dev/null; then
+              if ! grep -A 30 'type.*=.*"native\|browser\|service"' "$file" | grep 'pkce_required' > /dev/null; then
+                ISSUES+="$file: Public client type should have pkce_required explicitly set\n"
+              fi
+            fi
+
+            # Check 4: client_secret_post with refresh_token should have refresh_token_leeway
+            if grep -A 30 'token_endpoint_auth_method.*=.*"client_secret_post"' "$file" | grep 'refresh_token' > /dev/null; then
+              if ! grep -A 40 'token_endpoint_auth_method.*=.*"client_secret_post"' "$file" | grep 'refresh_token_leeway' > /dev/null; then
+                ISSUES+="$file: OAuth app with refresh_token grant should consider setting refresh_token_leeway\n"
+              fi
+            fi
+          done
+
+          if [ -n "$ISSUES" ]; then
+            echo "⚠️  OAuth app configuration issues found:" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+            echo -e "$ISSUES" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+            echo "See CLAUDE.md Gotcha #5 and docs/OAUTH_AUTHENTICATION_NOTES.md" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "✅ OAuth app configurations look good" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Check for Hardcoded Secrets
+        working-directory: environments/${{ matrix.environment }}/terraform
+        run: |
+          echo "## Security Check: Hardcoded Secrets" >> $GITHUB_STEP_SUMMARY
+
+          # Check for potential hardcoded secrets
+          SECRETS=$(grep -r -i 'password\s*=\s*"' . --include="*.tf" || true)
+          SECRETS+=$(grep -r -i 'api_token\s*=\s*"' . --include="*.tf" || true)
+          SECRETS+=$(grep -r -i 'secret\s*=\s*"' . --include="*.tf" || true)
+
+          # Exclude variable definitions, var. references, and commented examples
+          SECRETS=$(echo "$SECRETS" | grep -v 'variable "' || true)
+          SECRETS=$(echo "$SECRETS" | grep -v 'var\.' || true)
+          SECRETS=$(echo "$SECRETS" | grep -v '^\s*#' || true)
+          SECRETS=$(echo "$SECRETS" | grep -v ':#\s*' || true)
+
+          if [ -n "$SECRETS" ]; then
+            echo "❌ Potential hardcoded secrets found:" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+            echo "$SECRETS" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+            echo "Use variables and GitHub secrets instead" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          else
+            echo "✅ No hardcoded secrets detected" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Check SAML App Configuration
+        working-directory: environments/${{ matrix.environment }}/terraform
+        run: |
+          echo "## SAML App Configuration Validation" >> $GITHUB_STEP_SUMMARY
+
+          # Find okta_app_saml resources
+          SAML_APPS=$(grep -l 'resource "okta_app_saml"' *.tf 2>/dev/null || true)
+
+          ISSUES=""
+          for file in $SAML_APPS; do
+            # Check for required SAML fields
+            if ! grep -A 50 'resource "okta_app_saml"' "$file" | grep 'sso_url' > /dev/null; then
+              ISSUES+="$file: SAML app missing sso_url (required for SSO configuration)\n"
+            fi
+            if ! grep -A 50 'resource "okta_app_saml"' "$file" | grep 'recipient' > /dev/null; then
+              ISSUES+="$file: SAML app missing recipient (required for security)\n"
+            fi
+            if ! grep -A 50 'resource "okta_app_saml"' "$file" | grep 'destination' > /dev/null; then
+              ISSUES+="$file: SAML app missing destination (required for security)\n"
+            fi
+            if ! grep -A 50 'resource "okta_app_saml"' "$file" | grep 'audience' > /dev/null; then
+              ISSUES+="$file: SAML app missing audience (required for security)\n"
+            fi
+
+            # Check for deprecated preconfigured_app
+            if grep -A 10 'resource "okta_app_saml"' "$file" | grep 'preconfigured_app' > /dev/null; then
+              ISSUES+="$file: preconfigured_app is deprecated, use app_settings_json instead\n"
+            fi
+          done
+
+          if [ -n "$ISSUES" ]; then
+            echo "⚠️  SAML app configuration issues found:" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+            echo -e "$ISSUES" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "✅ SAML app configurations look good" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Check for System Apps
+        working-directory: environments/${{ matrix.environment }}/terraform
+        run: |
+          echo "## System Apps Check" >> $GITHUB_STEP_SUMMARY
+
+          # Check for Okta system apps that shouldn't be managed
+          SYSTEM_APPS=$(grep -r 'okta-iga-reviewer\|okta-flow-sso\|okta-access-requests-resource-catalog\|okta-atspoke-sso' . --include="*.tf" || true)
+
+          if [ -n "$SYSTEM_APPS" ]; then
+            echo "❌ System apps found (these cannot be managed in Terraform):" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+            echo "$SYSTEM_APPS" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+            echo "See CLAUDE.md Gotcha #4" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          else
+            echo "✅ No system apps detected" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Check Resource Naming Conventions
+        working-directory: environments/${{ matrix.environment }}/terraform
+        run: |
+          echo "## Resource Naming Convention Check" >> $GITHUB_STEP_SUMMARY
+
+          # Check that all resources have labels or names
+          RESOURCES=$(grep -h '^resource' *.tf 2>/dev/null || true)
+          UNLABELED=""
+
+          while IFS= read -r line; do
+            FILE=$(grep -l "$line" *.tf | head -1)
+            RESOURCE_TYPE=$(echo "$line" | awk '{print $2}' | tr -d '"')
+            RESOURCE_NAME=$(echo "$line" | awk '{print $3}' | tr -d '"')
+
+            # Check if resource has a label or name within next 10 lines
+            if ! grep -A 10 "$line" "$FILE" | grep -q 'label\|name.*='; then
+              UNLABELED+="$FILE: $RESOURCE_TYPE.$RESOURCE_NAME\n"
+            fi
+          done <<< "$RESOURCES"
+
+          if [ -n "$UNLABELED" ]; then
+            echo "⚠️  Resources without labels/names:" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+            echo -e "$UNLABELED" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+            echo "Consider adding descriptive labels/names to all resources" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "✅ All resources have labels/names" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Check Group Assignment Configuration
+        working-directory: environments/${{ matrix.environment }}/terraform
+        run: |
+          echo "## Group Assignment Validation" >> $GITHUB_STEP_SUMMARY
+
+          # Find okta_group resources
+          GROUP_RESOURCES=$(grep -l 'resource "okta_group"' *.tf 2>/dev/null || true)
+
+          ISSUES=""
+          for file in $GROUP_RESOURCES; do
+            # Extract group resource blocks
+            BLOCKS=$(awk '/resource "okta_group"/,/^}/' "$file")
+
+            # Check for both skip_users and custom_profile_attributes (conflicting)
+            if echo "$BLOCKS" | grep 'skip_users' > /dev/null && echo "$BLOCKS" | grep 'custom_profile_attributes' > /dev/null; then
+              ISSUES+="$file: Group cannot have both skip_users and custom_profile_attributes\n"
+            fi
+          done
+
+          if [ -n "$ISSUES" ]; then
+            echo "⚠️  Group configuration issues found:" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+            echo -e "$ISSUES" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "✅ Group configurations look good" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Check Profile Mapping Configuration
+        working-directory: environments/${{ matrix.environment }}/terraform
+        run: |
+          echo "## Profile Mapping Validation" >> $GITHUB_STEP_SUMMARY
+
+          # Find okta_profile_mapping resources
+          MAPPING_FILES=$(grep -l 'resource "okta_profile_mapping"' *.tf 2>/dev/null || true)
+
+          ISSUES=""
+          for file in $MAPPING_FILES; do
+            # Check for mappings block existence
+            if ! grep -A 20 'resource "okta_profile_mapping"' "$file" | grep 'mappings' > /dev/null; then
+              ISSUES+="$file: Profile mapping missing 'mappings' block\n"
+            fi
+
+            # Check for push_status when mastering is enabled
+            if grep -A 30 'resource "okta_profile_mapping"' "$file" | grep 'delete_when_absent.*=.*true' > /dev/null; then
+              if ! grep -A 30 'resource "okta_profile_mapping"' "$file" | grep 'push_status' > /dev/null; then
+                ISSUES+="$file: Profile mapping with delete_when_absent requires push_status\n"
+              fi
+            fi
+          done
+
+          if [ -n "$ISSUES" ]; then
+            echo "⚠️  Profile mapping issues found:" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+            echo -e "$ISSUES" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "✅ Profile mapping configurations look good" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Check User Schema Configuration
+        working-directory: environments/${{ matrix.environment }}/terraform
+        run: |
+          echo "## User Schema Validation" >> $GITHUB_STEP_SUMMARY
+
+          # Find okta_user_schema_property resources
+          SCHEMA_FILES=$(grep -l 'resource "okta_user_schema_property"' *.tf 2>/dev/null || true)
+
+          ISSUES=""
+          for file in $SCHEMA_FILES; do
+            # Check type consistency with other attributes
+            # Number type should not have min_length/max_length
+            if grep -A 15 'type.*=.*"number"' "$file" | grep -E 'min_length|max_length' > /dev/null; then
+              ISSUES+="$file: User schema property with type='number' cannot have min_length/max_length\n"
+            fi
+
+            # String type should not have enum for large lists
+            if grep -A 15 'type.*=.*"string"' "$file" | grep -A 50 'enum.*=.*\[' | wc -l | grep -E '^[5-9][0-9]|^[1-9][0-9]{2,}' > /dev/null; then
+              ISSUES+="$file: Large enum in user schema property, consider using array_enum instead\n"
+            fi
+          done
+
+          if [ -n "$ISSUES" ]; then
+            echo "⚠️  User schema issues found:" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+            echo -e "$ISSUES" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "✅ User schema configurations look good" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Check Network Zone Configuration
+        working-directory: environments/${{ matrix.environment }}/terraform
+        run: |
+          echo "## Network Zone Validation" >> $GITHUB_STEP_SUMMARY
+
+          # Find okta_network_zone resources
+          ZONE_FILES=$(grep -l 'resource "okta_network_zone"' *.tf 2>/dev/null || true)
+
+          ISSUES=""
+          for file in $ZONE_FILES; do
+            # Check for valid CIDR notation in gateways
+            INVALID_CIDRS=$(grep -A 20 'resource "okta_network_zone"' "$file" | grep 'gateways' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | grep -v '/' || true)
+            if [ -n "$INVALID_CIDRS" ]; then
+              ISSUES+="$file: Network zone gateways should use CIDR notation (e.g., 192.168.1.0/24)\n"
+            fi
+
+            # Check for at least one location definition
+            if ! grep -A 30 'resource "okta_network_zone"' "$file" | grep -E 'gateways|proxies|asns|locations' > /dev/null; then
+              ISSUES+="$file: Network zone must define at least one of: gateways, proxies, asns, or locations\n"
+            fi
+          done
+
+          if [ -n "$ISSUES" ]; then
+            echo "⚠️  Network zone issues found:" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+            echo -e "$ISSUES" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "✅ Network zone configurations look good" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Validation Summary
+        if: always()
+        run: |
+          echo "## Validation Complete for ${{ matrix.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "All checks completed. Review results above." >> $GITHUB_STEP_SUMMARY
+
+      - name: Comment PR with Results
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+
+            // Read step summary
+            const summary = process.env.GITHUB_STEP_SUMMARY ?
+              fs.readFileSync(process.env.GITHUB_STEP_SUMMARY, 'utf8') :
+              'Validation completed';
+
+            const output = `## Terraform Validation Results: ${{ matrix.environment }}
+
+            ${summary}
+
+            *Environment: ${{ matrix.environment }}*
+            `;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            });

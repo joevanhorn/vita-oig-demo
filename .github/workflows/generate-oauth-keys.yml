@@ -1,0 +1,164 @@
+name: Generate OAuth Keys
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to generate keys for'
+        required: true
+        type: choice
+        options:
+          - demo-ntrs-oig-clientaccess-poc
+          - myorg
+          - production
+          - staging
+          - development
+
+permissions:
+  contents: read
+
+jobs:
+  generate-keys:
+    name: Generate and Store OAuth Keys
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Generate RSA Key Pair
+        id: generate
+        run: |
+          echo "Generating 2048-bit RSA key pair..."
+
+          # Generate private key
+          openssl genrsa -out /tmp/private.pem 2048
+
+          # Extract public key
+          openssl rsa -in /tmp/private.pem -pubout -out /tmp/public.pem
+
+          # Convert to PKCS#1 format for Terraform
+          openssl rsa -in /tmp/private.pem -traditional -out /tmp/private_pkcs1.pem
+
+          echo "✅ Keys generated successfully"
+
+      - name: Convert Public Key to JWK
+        id: jwk
+        run: |
+          python3 << 'PYEOF'
+          import json
+          import base64
+          import subprocess
+          import re
+          import secrets
+          import os
+
+          # Get modulus from public key
+          modulus_hex = subprocess.check_output(
+              ['openssl', 'rsa', '-pubin', '-in', '/tmp/public.pem', '-modulus', '-noout'],
+              text=True
+          ).strip().replace('Modulus=', '')
+
+          # Get exponent
+          rsa_details = subprocess.check_output(
+              ['openssl', 'rsa', '-pubin', '-in', '/tmp/public.pem', '-text', '-noout'],
+              text=True
+          )
+
+          match = re.search(r'Exponent:\s+\d+\s+\(0x([0-9a-fA-F]+)\)', rsa_details)
+          if match:
+              exp_hex = match.group(1)
+              exp_int = int(exp_hex, 16)
+          else:
+              exp_int = 65537
+
+          # Convert to base64url
+          modulus_bytes = bytes.fromhex(modulus_hex)
+          n_b64 = base64.urlsafe_b64encode(modulus_bytes).decode('utf-8').rstrip('=')
+
+          exp_bytes = exp_int.to_bytes((exp_int.bit_length() + 7) // 8, byteorder='big')
+          e_b64 = base64.urlsafe_b64encode(exp_bytes).decode('utf-8').rstrip('=')
+
+          # Generate kid
+          kid = "terraform-key-" + secrets.token_hex(4)
+
+          # Construct JWK
+          jwk = {
+              "kty": "RSA",
+              "kid": kid,
+              "use": "sig",
+              "alg": "RS256",
+              "n": n_b64,
+              "e": e_b64
+          }
+
+          # Save JWK to file
+          with open('/tmp/public_jwk.json', 'w') as f:
+              json.dump(jwk, f, indent=2)
+
+          # Output kid for GitHub
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f"kid={kid}\n")
+
+          print("✅ JWK created successfully")
+          print(f"Key ID (kid): {kid}")
+          PYEOF
+
+      - name: Save Keys to Artifact
+        run: |
+          # Save kid to file for easy access
+          echo "${{ steps.jwk.outputs.kid }}" > /tmp/key_id.txt
+          echo "✅ Keys prepared for download"
+
+      - name: Display Instructions
+        run: |
+          echo "=========================================="
+          echo "✅ KEYS GENERATED SUCCESSFULLY"
+          echo "=========================================="
+          echo ""
+          echo "STEP 1: Update GitHub Secrets"
+          echo "=========================================="
+          echo ""
+          echo "Go to: Settings → Secrets and variables → Actions → Environments → ${{ inputs.environment }}"
+          echo ""
+          echo "1. Update OKTA_PRIVATE_KEY_ID with:"
+          echo ""
+          cat /tmp/key_id.txt
+          echo ""
+          echo ""
+          echo "2. Update OKTA_PRIVATE_KEY with (copy everything between the lines):"
+          echo "========================================================================"
+          cat /tmp/private_pkcs1.pem
+          echo "========================================================================"
+          echo ""
+          echo ""
+          echo "STEP 2: Upload Public Key to Okta"
+          echo "=========================================="
+          echo ""
+          echo "1. Log into Okta Admin Console"
+          echo "2. Go to Applications → Your Terraform Service App"
+          echo "3. General tab → Client Credentials → Edit"
+          echo "4. ⚠️  Turn OFF 'Require DPoP' (if enabled)"
+          echo "5. Under Public Keys:"
+          echo "   - Remove old key"
+          echo "   - Click 'Add Key'"
+          echo "   - Paste this JWK:"
+          echo ""
+          cat /tmp/public_jwk.json
+          echo ""
+          echo "6. Save changes"
+          echo ""
+          echo ""
+          echo "STEP 3: Run Terraform Apply"
+          echo "=========================================="
+          echo ""
+          echo "gh workflow run terraform-apply-with-approval.yml -f environment=${{ inputs.environment }}"
+          echo ""
+          echo "=========================================="
+
+      - name: Cleanup Sensitive Files
+        if: always()
+        run: |
+          rm -f /tmp/private.pem
+          rm -f /tmp/private_pkcs1.pem
+          rm -f /tmp/public.pem
+          rm -f /tmp/public_jwk.json

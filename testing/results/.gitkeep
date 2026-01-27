@@ -1,0 +1,25 @@
+# Validation Results Archive
+
+This directory stores completed validation test runs for audit and historical reference.
+
+## Naming Convention
+
+Use the format: `validation_run_YYYYMMDD.md`
+
+Example: `validation_run_20251107.md`
+
+## What to Include
+
+- Copy of completed MANUAL_VALIDATION_PLAN.md with filled-out checklists
+- Test results summary
+- Issues found
+- Recommendations
+
+## What to Exclude
+
+- API tokens
+- Passwords
+- User IDs
+- Any other sensitive information
+
+Redact sensitive data before storing completed runs.

@@ -1,0 +1,173 @@
+# ==============================================================================
+# AD DOMAIN CONTROLLER DEPLOYMENT WORKFLOW
+# ==============================================================================
+# Deploys AD Domain Controller infrastructure to one or more AWS regions.
+# Supports multi-region deployment via matrix strategy.
+# Supports multi-domain deployment via infrastructure_dir parameter.
+#
+# Usage (single domain):
+#   gh workflow run ad-deploy.yml \
+#     -f environment=myorg \
+#     -f regions='["us-east-1"]' \
+#     -f action=apply
+#
+# Usage (multi-domain - TaskVantage example):
+#   # Deploy AMER domain
+#   gh workflow run ad-deploy.yml \
+#     -f environment=taskvantage-prod \
+#     -f infrastructure_dir=ad-infrastructure-amer \
+#     -f regions='["us-east-1"]' \
+#     -f action=apply
+#
+#   # Deploy EMEA domain
+#   gh workflow run ad-deploy.yml \
+#     -f environment=taskvantage-prod \
+#     -f infrastructure_dir=ad-infrastructure-emea \
+#     -f regions='["us-east-1"]' \
+#     -f action=apply
+# ==============================================================================
+
+name: AD - Deploy Domain Controller
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment (e.g., myorg, taskvantage-prod)'
+        required: true
+        type: string
+        default: 'myorg'
+      infrastructure_dir:
+        description: 'Infrastructure directory (e.g., ad-infrastructure, ad-infrastructure-amer)'
+        required: false
+        type: string
+        default: 'ad-infrastructure'
+      regions:
+        description: 'AWS regions as JSON array (e.g., ["us-east-1", "us-west-2"])'
+        required: true
+        type: string
+        default: '["us-east-1"]'
+      action:
+        description: 'Terraform action'
+        required: true
+        type: choice
+        options:
+          - plan
+          - apply
+          - destroy
+        default: 'plan'
+      ad_domain_name:
+        description: 'AD Domain Name (optional - uses config default if not set)'
+        required: false
+        type: string
+        default: ''
+      ad_netbios_name:
+        description: 'AD NetBIOS Name (optional - uses config default if not set)'
+        required: false
+        type: string
+        default: ''
+      instance_type:
+        description: 'EC2 Instance Type'
+        required: false
+        type: string
+        default: 't3.medium'
+      create_sample_users:
+        description: 'Create sample users and groups'
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy AD to ${{ matrix.region }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        region: ${{ fromJson(inputs.regions) }}
+
+    environment:
+      name: ${{ inputs.environment }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: GitHubActions-AD-Deploy
+          aws-region: ${{ matrix.region }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.0"
+
+      - name: Terraform Init
+        working-directory: environments/${{ inputs.environment }}/${{ inputs.infrastructure_dir }}
+        run: |
+          terraform init \
+            -backend-config="key=Okta-GitOps/${{ inputs.environment }}/${{ inputs.infrastructure_dir }}/${{ matrix.region }}/terraform.tfstate"
+
+      - name: Terraform Plan
+        if: inputs.action == 'plan' || inputs.action == 'apply'
+        working-directory: environments/${{ inputs.environment }}/${{ inputs.infrastructure_dir }}
+        run: |
+          # Build variable arguments
+          VAR_ARGS="-var=aws_region=${{ matrix.region }}"
+          VAR_ARGS="$VAR_ARGS -var=instance_type=${{ inputs.instance_type }}"
+          VAR_ARGS="$VAR_ARGS -var=environment=${{ inputs.environment }}"
+
+          # Only add domain vars if explicitly provided (allows config defaults)
+          if [ -n "${{ inputs.ad_domain_name }}" ]; then
+            VAR_ARGS="$VAR_ARGS -var=ad_domain_name=${{ inputs.ad_domain_name }}"
+          fi
+          if [ -n "${{ inputs.ad_netbios_name }}" ]; then
+            VAR_ARGS="$VAR_ARGS -var=ad_netbios_name=${{ inputs.ad_netbios_name }}"
+          fi
+
+          terraform plan $VAR_ARGS -out=tfplan
+
+      - name: Terraform Apply
+        if: inputs.action == 'apply'
+        working-directory: environments/${{ inputs.environment }}/${{ inputs.infrastructure_dir }}
+        run: |
+          terraform apply -auto-approve tfplan
+
+      - name: Terraform Destroy
+        if: inputs.action == 'destroy'
+        working-directory: environments/${{ inputs.environment }}/${{ inputs.infrastructure_dir }}
+        run: |
+          # Build variable arguments
+          VAR_ARGS="-var=aws_region=${{ matrix.region }}"
+          VAR_ARGS="$VAR_ARGS -var=instance_type=${{ inputs.instance_type }}"
+          VAR_ARGS="$VAR_ARGS -var=environment=${{ inputs.environment }}"
+
+          # Only add domain vars if explicitly provided
+          if [ -n "${{ inputs.ad_domain_name }}" ]; then
+            VAR_ARGS="$VAR_ARGS -var=ad_domain_name=${{ inputs.ad_domain_name }}"
+          fi
+          if [ -n "${{ inputs.ad_netbios_name }}" ]; then
+            VAR_ARGS="$VAR_ARGS -var=ad_netbios_name=${{ inputs.ad_netbios_name }}"
+          fi
+
+          terraform destroy -auto-approve $VAR_ARGS
+
+      - name: Get Outputs
+        if: inputs.action == 'apply'
+        working-directory: environments/${{ inputs.environment }}/${{ inputs.infrastructure_dir }}
+        run: |
+          echo "## AD Deployment Results for ${{ inputs.infrastructure_dir }} in ${{ matrix.region }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Output | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Instance ID | $(terraform output -raw instance_id) |" >> $GITHUB_STEP_SUMMARY
+          echo "| Private IP | $(terraform output -raw private_ip) |" >> $GITHUB_STEP_SUMMARY
+          echo "| Domain Name | $(terraform output -raw domain_name) |" >> $GITHUB_STEP_SUMMARY
+          echo "| SSM Command | \`$(terraform output -raw ssm_session_command)\` |" >> $GITHUB_STEP_SUMMARY

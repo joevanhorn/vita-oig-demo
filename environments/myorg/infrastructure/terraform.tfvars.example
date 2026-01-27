@@ -1,0 +1,69 @@
+# ==============================================================================
+# Example Terraform Variables File
+# ==============================================================================
+# Copy this file to terraform.tfvars and fill in your values
+# cp terraform.tfvars.example terraform.tfvars
+#
+# IMPORTANT: terraform.tfvars is gitignored - never commit sensitive values!
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# General Configuration
+# ------------------------------------------------------------------------------
+
+environment_name = "production" # Should match your Okta environment directory name
+aws_region       = "us-east-1"  # AWS region for infrastructure
+
+# ------------------------------------------------------------------------------
+# Network Configuration
+# ------------------------------------------------------------------------------
+
+vpc_cidr           = "10.0.0.0/16"
+public_subnet_cidr = "10.0.1.0/24"
+
+# SECURITY: Restrict RDP access to your IP address!
+# Example: ["1.2.3.4/32"] for single IP
+# Example: ["10.0.0.0/8"] for internal network
+allowed_rdp_cidrs = ["0.0.0.0/0"] # CHANGE THIS!
+
+# ------------------------------------------------------------------------------
+# Active Directory Configuration
+# ------------------------------------------------------------------------------
+
+ad_domain_name = "demo.local" # Your AD domain name
+ad_netbios_name = "DEMO"      # NetBIOS name (uppercase, max 15 chars)
+
+# REQUIRED: Set these via environment variables for security
+# export TF_VAR_ad_safe_mode_password="YourSafeModePassword123!"
+# export TF_VAR_admin_password="YourAdminPassword123!"
+
+# Or uncomment and set here (not recommended for production):
+# ad_safe_mode_password = "YourSecurePassword123!"
+# admin_password        = "YourAdminPassword123!"
+
+# ------------------------------------------------------------------------------
+# EC2 Configuration
+# ------------------------------------------------------------------------------
+
+dc_instance_type = "t3.medium" # t3.medium minimum for DC
+dc_volume_size   = 50          # Root volume size in GB
+
+# Optional: Provide EC2 key pair name for SSH/RDP access
+# key_pair_name = "my-ec2-keypair"
+
+# ------------------------------------------------------------------------------
+# Okta Configuration
+# ------------------------------------------------------------------------------
+
+okta_org_url     = "https://dev-12345.okta.com" # Your Okta org URL
+okta_opa_enabled = true                          # Enable Okta Privileged Access
+
+# ------------------------------------------------------------------------------
+# Tags
+# ------------------------------------------------------------------------------
+
+additional_tags = {
+  Owner       = "YourName"
+  CostCenter  = "IT"
+  Department  = "Engineering"
+}
