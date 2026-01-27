@@ -89,7 +89,7 @@ resource "okta_realm" "virginia_agencies" {
   for_each = local.virginia_agencies
 
   name       = "${each.key} - ${each.value}"
-  realm_type = "DEFAULT"
+  realm_type = "PARTNER"
 }
 
 # =============================================================================
