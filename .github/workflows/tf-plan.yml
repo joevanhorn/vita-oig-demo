@@ -9,6 +9,7 @@ on:
         default: 'myorg'
         type: choice
         options:
+          - vita-oig-preview
           - myorg
           - production
           - staging
