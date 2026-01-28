@@ -93,6 +93,57 @@ resource "okta_realm" "virginia_agencies" {
 }
 
 # =============================================================================
+# Realm Admin Groups
+# =============================================================================
+# Each realm has a corresponding admin group for delegated administration.
+# Members of these groups will be granted realm admin permissions.
+# =============================================================================
+
+resource "okta_group" "realm_admins" {
+  for_each = local.virginia_agencies
+
+  name        = "${each.key}-realm-admin"
+  description = "Realm administrators for ${each.value}"
+}
+
+# =============================================================================
+# Custom Admin Role
+# =============================================================================
+# A single custom admin role used across all realms for consistent permissions.
+# This role grants user and group management capabilities.
+# =============================================================================
+
+resource "okta_admin_role_custom" "realm_admin" {
+  label       = "Realm Administrator"
+  description = "Custom admin role for realm user and group management"
+  permissions = [
+    "okta.users.read",
+    "okta.users.manage",
+    "okta.groups.read",
+    "okta.groups.manage"
+  ]
+}
+
+# =============================================================================
+# Resource Sets
+# =============================================================================
+# Each realm has a resource set that scopes admin permissions to that realm.
+# Currently includes the realm and its users. Can be extended to include
+# apps and groups in scope.
+# =============================================================================
+
+resource "okta_resource_set" "realm_resources" {
+  for_each = local.virginia_agencies
+
+  label       = "${each.key} Realm Resources"
+  description = "Resource set for ${each.value} realm administration"
+  resources   = [
+    "https://${var.okta_org_name}.${var.okta_base_url}/api/v1/realms/${okta_realm.virginia_agencies[each.key].id}",
+    "https://${var.okta_org_name}.${var.okta_base_url}/api/v1/realms/${okta_realm.virginia_agencies[each.key].id}/users"
+  ]
+}
+
+# =============================================================================
 # Outputs
 # =============================================================================
 
@@ -106,4 +157,23 @@ output "realm_ids" {
 output "realm_count" {
   description = "Total number of realms created"
   value       = length(okta_realm.virginia_agencies)
+}
+
+output "realm_admin_group_ids" {
+  description = "Map of agency abbreviations to their realm admin group IDs"
+  value = {
+    for abbrev, group in okta_group.realm_admins : abbrev => group.id
+  }
+}
+
+output "realm_admin_role_id" {
+  description = "ID of the custom Realm Administrator role"
+  value       = okta_admin_role_custom.realm_admin.id
+}
+
+output "realm_resource_set_ids" {
+  description = "Map of agency abbreviations to their resource set IDs"
+  value = {
+    for abbrev, rs in okta_resource_set.realm_resources : abbrev => rs.id
+  }
 }
