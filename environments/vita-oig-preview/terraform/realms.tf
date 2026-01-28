@@ -144,6 +144,24 @@ resource "okta_resource_set" "realm_resources" {
 }
 
 # =============================================================================
+# Admin Role Assignments
+# =============================================================================
+# Binds the realm admin groups to the custom role with their resource sets.
+# Members of each realm admin group will have the Realm Administrator role
+# scoped to their specific realm's resources.
+# =============================================================================
+
+resource "okta_admin_role_custom_assignments" "realm_admin_assignments" {
+  for_each = local.virginia_agencies
+
+  resource_set_id = okta_resource_set.realm_resources[each.key].id
+  custom_role_id  = okta_admin_role_custom.realm_admin.id
+  members = [
+    format("https://%s.%s/api/v1/groups/%s", var.okta_org_name, var.okta_base_url, okta_group.realm_admins[each.key].id)
+  ]
+}
+
+# =============================================================================
 # Outputs
 # =============================================================================
 
@@ -175,5 +193,12 @@ output "realm_resource_set_ids" {
   description = "Map of agency abbreviations to their resource set IDs"
   value = {
     for abbrev, rs in okta_resource_set.realm_resources : abbrev => rs.id
+  }
+}
+
+output "realm_admin_assignment_ids" {
+  description = "Map of agency abbreviations to their admin role assignment IDs"
+  value = {
+    for abbrev, assignment in okta_admin_role_custom_assignments.realm_admin_assignments : abbrev => assignment.id
   }
 }
