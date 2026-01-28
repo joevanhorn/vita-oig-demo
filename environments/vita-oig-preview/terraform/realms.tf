@@ -88,7 +88,7 @@ locals {
 resource "okta_realm" "virginia_agencies" {
   for_each = local.virginia_agencies
 
-  name       = "${each.key} - ${each.value}"
+  name       = each.key
   realm_type = "PARTNER"
 }
 
