@@ -169,12 +169,16 @@ resource "okta_admin_role_custom_assignments" "realm_admin_assignments" {
 # corresponding realm (e.g., @boa.gov -> BOA realm).
 # =============================================================================
 
+# Data source to get the default Okta profile source (Universal Directory)
+data "okta_user_profile_mapping_source" "default" {}
+
 resource "okta_realm_assignment" "domain_based" {
   for_each = local.virginia_agencies
 
   name                 = "${each.key} Domain Assignment"
   priority             = 1
   status               = "ACTIVE"
+  profile_source_id    = data.okta_user_profile_mapping_source.default.id
   condition_expression = "user.profile.login.contains(\"@${lower(each.key)}.gov\")"
   realm_id             = okta_realm.virginia_agencies[each.key].id
 }
