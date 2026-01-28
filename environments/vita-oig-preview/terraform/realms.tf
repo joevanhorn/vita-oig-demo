@@ -162,6 +162,24 @@ resource "okta_admin_role_custom_assignments" "realm_admin_assignments" {
 }
 
 # =============================================================================
+# Realm Assignment Rules
+# =============================================================================
+# Domain-based realm assignments automatically assign users to realms based on
+# their email domain. Users with @[abbrev].gov emails are assigned to the
+# corresponding realm (e.g., @boa.gov -> BOA realm).
+# =============================================================================
+
+resource "okta_realm_assignment" "domain_based" {
+  for_each = local.virginia_agencies
+
+  name                 = "${each.key} Domain Assignment"
+  priority             = 1
+  status               = "ACTIVE"
+  condition_expression = "user.profile.login.contains(\"@${lower(each.key)}.gov\")"
+  realm_id             = okta_realm.virginia_agencies[each.key].id
+}
+
+# =============================================================================
 # Outputs
 # =============================================================================
 
@@ -200,5 +218,12 @@ output "realm_admin_assignment_ids" {
   description = "Map of agency abbreviations to their admin role assignment IDs"
   value = {
     for abbrev, assignment in okta_admin_role_custom_assignments.realm_admin_assignments : abbrev => assignment.id
+  }
+}
+
+output "realm_assignment_ids" {
+  description = "Map of agency abbreviations to their realm assignment rule IDs"
+  value = {
+    for abbrev, assignment in okta_realm_assignment.domain_based : abbrev => assignment.id
   }
 }
