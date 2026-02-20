@@ -125,25 +125,6 @@ resource "okta_admin_role_custom" "realm_admin" {
 }
 
 # =============================================================================
-# Resource Sets
-# =============================================================================
-# Each realm has a resource set that scopes admin permissions to that realm.
-# Currently includes the realm and its users. Can be extended to include
-# apps and groups in scope.
-# =============================================================================
-
-resource "okta_resource_set" "realm_resources" {
-  for_each = local.virginia_agencies
-
-  label       = "${each.key} Realm Resources"
-  description = "Resource set for ${each.value} realm administration"
-  resources   = [
-    "https://${var.okta_org_name}.${var.okta_base_url}/api/v1/realms/${okta_realm.virginia_agencies[each.key].id}",
-    "https://${var.okta_org_name}.${var.okta_base_url}/api/v1/realms/${okta_realm.virginia_agencies[each.key].id}/users"
-  ]
-}
-
-# =============================================================================
 # Admin Role Assignments
 # =============================================================================
 # Binds the realm admin groups to the custom role with their resource sets.
@@ -159,33 +140,6 @@ resource "okta_admin_role_custom_assignments" "realm_admin_assignments" {
   members = [
     format("https://%s.%s/api/v1/groups/%s", var.okta_org_name, var.okta_base_url, okta_group.realm_admins[each.key].id)
   ]
-}
-
-# =============================================================================
-# Realm Assignment Rules
-# =============================================================================
-# Domain-based realm assignments automatically assign users to realms based on
-# their email domain. Users with @[abbrev].gov emails are assigned to the
-# corresponding realm (e.g., @boa.gov -> BOA realm).
-# =============================================================================
-
-# Profile source ID for realm assignments (Okta Universal Directory app)
-# This is the app ID for the Okta profile source, not the user type ID
-variable "okta_profile_source_id" {
-  description = "Okta profile source ID for realm assignments"
-  type        = string
-  default     = "00oua8uw7ad8TmALa1d7"
-}
-
-resource "okta_realm_assignment" "domain_based" {
-  for_each = local.virginia_agencies
-
-  name                 = "${each.key} Domain Assignment"
-  priority             = 1
-  status               = "ACTIVE"
-  profile_source_id    = var.okta_profile_source_id
-  condition_expression = "user.profile.login.contains(\"@${lower(each.key)}.gov\")"
-  realm_id             = okta_realm.virginia_agencies[each.key].id
 }
 
 # =============================================================================
@@ -216,13 +170,6 @@ output "realm_admin_role_id" {
   value       = okta_admin_role_custom.realm_admin.id
 }
 
-output "realm_resource_set_ids" {
-  description = "Map of agency abbreviations to their resource set IDs"
-  value = {
-    for abbrev, rs in okta_resource_set.realm_resources : abbrev => rs.id
-  }
-}
-
 output "realm_admin_assignment_ids" {
   description = "Map of agency abbreviations to their admin role assignment IDs"
   value = {
@@ -230,9 +177,3 @@ output "realm_admin_assignment_ids" {
   }
 }
 
-output "realm_assignment_ids" {
-  description = "Map of agency abbreviations to their realm assignment rule IDs"
-  value = {
-    for abbrev, assignment in okta_realm_assignment.domain_based : abbrev => assignment.id
-  }
-}
