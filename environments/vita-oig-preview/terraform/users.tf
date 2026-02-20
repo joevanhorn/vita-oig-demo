@@ -10,7 +10,7 @@
 
 locals {
   csv_users = csvdecode(file("${path.module}/vita_users.csv"))
-  users_map = {} # Temporarily empty to destroy existing PROVISIONED users
+  users_map = { for user in local.csv_users : user.key => user }
 }
 
 resource "okta_user" "demo_users" {
@@ -22,7 +22,7 @@ resource "okta_user" "demo_users" {
   email      = each.value.login
   department = each.value.department
   title      = each.value.title
-  status     = "ACTIVE"
+  password   = "Welcome123!"
 
   lifecycle {
     ignore_changes = [password, recovery_answer, recovery_question]
