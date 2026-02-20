@@ -42,23 +42,22 @@ resource "okta_group_rule" "agency_domain_assignment" {
 # =============================================================================
 # Resource Sets (Delegated Administration)
 # =============================================================================
-# Each resource set scopes admin permissions to a specific agency's realm,
-# users, and groups. Realm admins can manage users within their realm and
-# the agency's user group and admin group.
-#
-# Moved from realms.tf and extended to include agency groups.
+# Each resource set scopes Department Administrator permissions to a specific
+# agency's realm, users, groups, and applications. Department admins can
+# manage users, group membership, and app assignments within their scope.
 # =============================================================================
 
 resource "okta_resource_set" "realm_resources" {
   for_each = local.virginia_agencies
 
-  label       = "${each.key} Realm Resources"
-  description = "Resource set for ${each.value} realm administration"
+  label       = "${each.key} Department Resources"
+  description = "Resource set for ${each.value} delegated administration"
   resources = [
     "https://${var.okta_org_name}.${var.okta_base_url}/api/v1/realms/${okta_realm.virginia_agencies[each.key].id}",
     "https://${var.okta_org_name}.${var.okta_base_url}/api/v1/realms/${okta_realm.virginia_agencies[each.key].id}/users",
     "https://${var.okta_org_name}.${var.okta_base_url}/api/v1/groups/${okta_group.agency_users[each.key].id}",
-    "https://${var.okta_org_name}.${var.okta_base_url}/api/v1/groups/${okta_group.realm_admins[each.key].id}"
+    "https://${var.okta_org_name}.${var.okta_base_url}/api/v1/groups/${okta_group.realm_admins[each.key].id}",
+    "https://${var.okta_org_name}.${var.okta_base_url}/api/v1/apps"
   ]
 }
 

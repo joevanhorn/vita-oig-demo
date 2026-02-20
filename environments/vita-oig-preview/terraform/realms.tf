@@ -93,43 +93,55 @@ resource "okta_realm" "virginia_agencies" {
 }
 
 # =============================================================================
-# Realm Admin Groups
+# Department Admin Groups
 # =============================================================================
-# Each realm has a corresponding admin group for delegated administration.
-# Members of these groups will be granted realm admin permissions.
+# Each agency has a corresponding admin group for delegated administration.
+# Members of these groups receive the Department Administrator role scoped
+# to their agency's resources (realm, users, groups, apps).
+#
+# To designate someone as a department admin:
+#   Okta Admin → Directory → Groups → {ABBREV}-dept-admin → Add Member
 # =============================================================================
 
 resource "okta_group" "realm_admins" {
   for_each = local.virginia_agencies
 
-  name        = "${each.key}-realm-admin"
-  description = "Realm administrators for ${each.value}"
+  name        = "${each.key}-dept-admin"
+  description = "Department administrators for ${each.value}"
 }
 
 # =============================================================================
-# Custom Admin Role
+# Custom Admin Role — Department Administrator
 # =============================================================================
-# A single custom admin role used across all realms for consistent permissions.
-# This role grants user and group management capabilities.
+# A single custom role used across all agencies. Permissions are granular:
+#   - User profiles + lifecycle (but NOT delete)
+#   - Credential resets (password, MFA, unlock)
+#   - Group membership (but NOT create/delete groups)
+#   - App assignment (but NOT app configuration)
 # =============================================================================
 
 resource "okta_admin_role_custom" "realm_admin" {
-  label       = "Realm Administrator"
-  description = "Custom admin role for realm user and group management"
+  label       = "Department Administrator"
+  description = "Delegated admin role for agency IT staff — manage users, credentials, group membership, and app assignments within their agency"
   permissions = [
     "okta.users.read",
-    "okta.users.manage",
+    "okta.users.userprofile.manage",
+    "okta.users.lifecycle.manage",
+    "okta.users.credentials.manage",
+    "okta.users.credentials.resetFactors",
     "okta.groups.read",
-    "okta.groups.manage"
+    "okta.groups.members.manage",
+    "okta.apps.read",
+    "okta.apps.assignment.manage",
   ]
 }
 
 # =============================================================================
 # Admin Role Assignments
 # =============================================================================
-# Binds the realm admin groups to the custom role with their resource sets.
-# Members of each realm admin group will have the Realm Administrator role
-# scoped to their specific realm's resources.
+# Binds the department admin groups to the custom role with their resource sets.
+# Members of each dept-admin group get the Department Administrator role
+# scoped to their specific agency's resources.
 # =============================================================================
 
 resource "okta_admin_role_custom_assignments" "realm_admin_assignments" {
@@ -159,14 +171,14 @@ output "realm_count" {
 }
 
 output "realm_admin_group_ids" {
-  description = "Map of agency abbreviations to their realm admin group IDs"
+  description = "Map of agency abbreviations to their department admin group IDs"
   value = {
     for abbrev, group in okta_group.realm_admins : abbrev => group.id
   }
 }
 
 output "realm_admin_role_id" {
-  description = "ID of the custom Realm Administrator role"
+  description = "ID of the custom Department Administrator role"
   value       = okta_admin_role_custom.realm_admin.id
 }
 
