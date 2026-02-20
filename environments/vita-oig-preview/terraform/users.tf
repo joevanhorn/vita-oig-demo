@@ -22,11 +22,10 @@ resource "okta_user" "demo_users" {
   email      = each.value.login
   department = each.value.department
   title      = each.value.title
-  password   = "Welcome123!"
   status     = "ACTIVE"
 
   lifecycle {
-    ignore_changes = [recovery_answer, recovery_question]
+    ignore_changes = [password, recovery_answer, recovery_question]
   }
 }
 
