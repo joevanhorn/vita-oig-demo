@@ -10,7 +10,7 @@
 
 locals {
   csv_users = csvdecode(file("${path.module}/vita_users.csv"))
-  users_map = { for user in local.csv_users : user.key => user }
+  users_map = {} # Temporarily empty to destroy existing PROVISIONED users
 }
 
 resource "okta_user" "demo_users" {
