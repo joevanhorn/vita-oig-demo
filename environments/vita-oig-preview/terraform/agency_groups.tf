@@ -56,7 +56,9 @@ resource "okta_resource_set" "realm_resources" {
     "https://${var.okta_org_name}.${var.okta_base_url}/api/v1/realms/${okta_realm.virginia_agencies[each.key].id}",
     "https://${var.okta_org_name}.${var.okta_base_url}/api/v1/realms/${okta_realm.virginia_agencies[each.key].id}/users",
     "https://${var.okta_org_name}.${var.okta_base_url}/api/v1/groups/${okta_group.agency_users[each.key].id}",
+    "https://${var.okta_org_name}.${var.okta_base_url}/api/v1/groups/${okta_group.agency_users[each.key].id}/users",
     "https://${var.okta_org_name}.${var.okta_base_url}/api/v1/groups/${okta_group.realm_admins[each.key].id}",
+    "https://${var.okta_org_name}.${var.okta_base_url}/api/v1/groups/${okta_group.realm_admins[each.key].id}/users",
     "https://${var.okta_org_name}.${var.okta_base_url}/api/v1/apps"
   ]
 }
