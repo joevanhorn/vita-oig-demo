@@ -27,7 +27,7 @@ variable "postgres_jdbc_driver_url" {
 }
 
 variable "generic_db_vpc_cidr" {
-  description = "CIDR of the Generic DB VPC (used for the PostgreSQL egress rule). Must match the generic-db-infrastructure vpc_cidr."
+  description = "CIDR of the VPC hosting the HR System DB (used for the PostgreSQL egress rule). Defaults to the account default VPC CIDR."
   type        = string
-  default     = "10.6.0.0/16"
+  default     = "172.31.0.0/16"
 }

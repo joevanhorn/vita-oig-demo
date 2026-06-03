@@ -46,11 +46,27 @@ provider "aws" {
 }
 
 # ==============================================================================
-# DATA SOURCES
+# DATA SOURCES - EXISTING VPC
 # ==============================================================================
+# The demo account is at its VPC limit, so the HR System deploys into an
+# existing VPC (the account default VPC unless var.vpc_id is set) rather than
+# creating a dedicated one. RDS + OPC agent share this VPC.
 
-data "aws_availability_zones" "available" {
-  state = "available"
+data "aws_vpc" "selected" {
+  id      = var.vpc_id != "" ? var.vpc_id : null
+  default = var.vpc_id == "" ? true : null
+}
+
+# Public subnets in the selected VPC (need >= 2 AZs for the RDS subnet group)
+data "aws_subnets" "public" {
+  filter {
+    name   = "vpc-id"
+    values = [data.aws_vpc.selected.id]
+  }
+  filter {
+    name   = "map-public-ip-on-launch"
+    values = ["true"]
+  }
 }
 
 # ==============================================================================
@@ -60,78 +76,14 @@ data "aws_availability_zones" "available" {
 locals {
   name_prefix = "vita-oig-preview-use1"
 
+  vpc_id            = data.aws_vpc.selected.id
+  public_subnet_ids = data.aws_subnets.public.ids
+
   common_tags = {
     Environment = "vita-oig-preview"
     Project     = "generic-db-connector"
     ManagedBy   = "terraform"
   }
-}
-
-# ==============================================================================
-# DEDICATED VPC
-# ==============================================================================
-
-resource "aws_vpc" "generic_db" {
-  cidr_block           = var.vpc_cidr
-  enable_dns_hostnames = true
-  enable_dns_support   = true
-
-  tags = merge(local.common_tags, {
-    Name = "${local.name_prefix}-generic-db-vpc"
-  })
-}
-
-resource "aws_internet_gateway" "generic_db" {
-  vpc_id = aws_vpc.generic_db.id
-
-  tags = merge(local.common_tags, {
-    Name = "${local.name_prefix}-generic-db-igw"
-  })
-}
-
-resource "aws_subnet" "generic_db_a" {
-  vpc_id                  = aws_vpc.generic_db.id
-  cidr_block              = cidrsubnet(var.vpc_cidr, 8, 1)
-  availability_zone       = data.aws_availability_zones.available.names[0]
-  map_public_ip_on_launch = true
-
-  tags = merge(local.common_tags, {
-    Name = "${local.name_prefix}-generic-db-subnet-a"
-  })
-}
-
-resource "aws_subnet" "generic_db_b" {
-  vpc_id                  = aws_vpc.generic_db.id
-  cidr_block              = cidrsubnet(var.vpc_cidr, 8, 2)
-  availability_zone       = data.aws_availability_zones.available.names[1]
-  map_public_ip_on_launch = true
-
-  tags = merge(local.common_tags, {
-    Name = "${local.name_prefix}-generic-db-subnet-b"
-  })
-}
-
-resource "aws_route_table" "generic_db" {
-  vpc_id = aws_vpc.generic_db.id
-
-  route {
-    cidr_block = "0.0.0.0/0"
-    gateway_id = aws_internet_gateway.generic_db.id
-  }
-
-  tags = merge(local.common_tags, {
-    Name = "${local.name_prefix}-generic-db-rt"
-  })
-}
-
-resource "aws_route_table_association" "generic_db_a" {
-  subnet_id      = aws_subnet.generic_db_a.id
-  route_table_id = aws_route_table.generic_db.id
-}
-
-resource "aws_route_table_association" "generic_db_b" {
-  subnet_id      = aws_subnet.generic_db_b.id
-  route_table_id = aws_route_table.generic_db.id
 }
 
 # ==============================================================================
@@ -141,7 +93,7 @@ resource "aws_route_table_association" "generic_db_b" {
 resource "aws_security_group" "postgres" {
   name        = "${local.name_prefix}-generic-db-postgres-sg"
   description = "Security group for PostgreSQL RDS (Generic DB Connector)"
-  vpc_id      = aws_vpc.generic_db.id
+  vpc_id      = local.vpc_id
 
   # PostgreSQL from OPC agent and allowed CIDRs
   ingress {
@@ -172,7 +124,7 @@ resource "aws_security_group" "postgres" {
 resource "aws_db_subnet_group" "postgres" {
   name        = "${local.name_prefix}-generic-db-subnet-group"
   description = "Subnet group for PostgreSQL RDS"
-  subnet_ids  = [aws_subnet.generic_db_a.id, aws_subnet.generic_db_b.id]
+  subnet_ids  = local.public_subnet_ids
 
   tags = merge(local.common_tags, {
     Name = "${local.name_prefix}-generic-db-subnet-group"
@@ -317,10 +269,10 @@ variable "aws_region" {
   default     = "us-east-1"
 }
 
-variable "vpc_cidr" {
-  description = "CIDR block for the dedicated Generic DB VPC"
+variable "vpc_id" {
+  description = "Existing VPC ID to deploy into. Leave empty to use the account default VPC."
   type        = string
-  default     = "10.6.0.0/16"
+  default     = ""
 }
 
 variable "db_name" {
@@ -413,12 +365,12 @@ output "security_group_id" {
 
 output "vpc_id" {
   description = "VPC ID"
-  value       = aws_vpc.generic_db.id
+  value       = local.vpc_id
 }
 
 output "public_subnet_ids" {
   description = "Public subnet IDs"
-  value       = [aws_subnet.generic_db_a.id, aws_subnet.generic_db_b.id]
+  value       = local.public_subnet_ids
 }
 
 output "connection_info" {
