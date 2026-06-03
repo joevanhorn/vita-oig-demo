@@ -154,6 +154,13 @@ resource "aws_secretsmanager_secret" "postgres_credentials" {
   description = "PostgreSQL credentials for Generic Database Connector (HR System)"
 
   tags = local.common_tags
+
+  # The org tagging policy auto-injects sys_CreatedBy/sys_CreatedDate tags on
+  # secrets, and an SCP denies secretsmanager:UntagResource. Ignore tag drift
+  # so Terraform never attempts to remove those org-managed tags.
+  lifecycle {
+    ignore_changes = [tags, tags_all]
+  }
 }
 
 resource "aws_secretsmanager_secret_version" "postgres_credentials" {
