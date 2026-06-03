@@ -48,6 +48,38 @@ data "terraform_remote_state" "generic_db" {
 }
 
 # ==============================================================================
+# AGENT PLACEMENT - SAME SUBNET AS THE RDS
+# ==============================================================================
+# The shared default VPC routes the 172.31.0.0/16 secondary CIDR to a network
+# appliance, which black-holes cross-subnet traffic. Same-subnet traffic is
+# switched at L2 and bypasses the route table, so the agent MUST land in the
+# same subnet as the RDS to reach it. Look up the DB's AZ and pick the public
+# subnet in that AZ (one public subnet per AZ in this VPC).
+
+data "aws_db_instance" "hr" {
+  db_instance_identifier = "vita-oig-preview-use1-generic-db"
+}
+
+data "aws_subnets" "db_az_public" {
+  filter {
+    name   = "vpc-id"
+    values = [data.terraform_remote_state.generic_db.outputs.vpc_id]
+  }
+  filter {
+    name   = "availability-zone"
+    values = [data.aws_db_instance.hr.availability_zone]
+  }
+  filter {
+    name   = "map-public-ip-on-launch"
+    values = ["true"]
+  }
+}
+
+locals {
+  agent_subnet_id = tolist(data.aws_subnets.db_az_public.ids)[0]
+}
+
+# ==============================================================================
 # SHARED SECURITY GROUP
 # ==============================================================================
 
@@ -129,7 +161,7 @@ module "opc_agents" {
   instance_number = each.value.instance_number
 
   vpc_id             = data.terraform_remote_state.generic_db.outputs.vpc_id
-  subnet_id          = data.terraform_remote_state.generic_db.outputs.public_subnet_ids[0]
+  subnet_id          = local.agent_subnet_id
   security_group_ids = [aws_security_group.opc_shared.id]
 
   database_host   = each.value.database_host
