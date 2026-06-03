@@ -331,9 +331,9 @@ variable "publicly_accessible" {
 }
 
 variable "db_allowed_cidrs" {
-  description = "CIDR blocks allowed to access PostgreSQL"
+  description = "CIDR blocks allowed to access PostgreSQL. Scoped to the VPC CIDR — a world-open (0.0.0.0/0) rule is auto-stripped by org security remediation."
   type        = list(string)
-  default     = ["0.0.0.0/0"] # Open for demo - restrict in production
+  default     = ["172.31.0.0/16"] # Default VPC CIDR; in-VPC sources (OPC agent) only
 }
 
 # ==============================================================================
@@ -363,6 +363,11 @@ output "jdbc_url" {
 output "credentials_secret" {
   description = "Secrets Manager secret name for credentials"
   value       = aws_secretsmanager_secret.postgres_credentials.name
+}
+
+output "credentials_secret_arn" {
+  description = "Secrets Manager secret ARN for credentials"
+  value       = aws_secretsmanager_secret.postgres_credentials.arn
 }
 
 output "security_group_id" {
