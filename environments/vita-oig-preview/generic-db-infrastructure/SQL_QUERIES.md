@@ -4,17 +4,47 @@ SQL queries for the Okta "On-prem Connector for Generic Databases" provisioning 
 
 > **CRITICAL: Downstream provisioning (Provisioning to App) MUST be enabled for entitlement import to work.** Without it, Okta silently ignores entitlement data — imports succeed and users appear, but `ent-*` attributes are never created on user profiles. You must enable "Provisioning to App" AND configure the Update User SQL query before entitlements will be imported. This is undocumented by Okta.
 
-## Import Users (Get All Users)
+## Import Users (Get All Users) — full profile
+
+> Aliased so each column imports as the matching Okta attribute. Non-id columns surface as `ext_<alias>` on the app profile; map them under **Provisioning → To Okta** (the custom attrs `ext_agencyName`, `ext_employmentType`, `ext_isHealthEmployee`, etc. must be added to the app profile in **Directory → Profile Editor** first).
 
 ```sql
-SELECT user_id AS "id", username AS "userName", email, first_name AS "givenName", last_name AS "familyName", display_name AS "displayName", department, title, status FROM users WHERE status = 'ACTIVE'
+SELECT user_id AS "id", username AS "userName", email,
+  first_name AS "givenName", last_name AS "familyName", display_name AS "displayName",
+  middle_name AS "middleName", nick_name AS "nickName", second_email AS "secondEmail",
+  mobile_phone AS "mobilePhone", primary_phone AS "primaryPhone",
+  street_address AS "streetAddress", city, state, zip_code AS "zipCode", country_code AS "countryCode",
+  department, title, user_type AS "userType", cost_center AS "costCenter",
+  organization, division, employee_number AS "employeeNumber", manager_id AS "managerId",
+  agency_name AS "agencyName", start_date AS "startDate", employment_type AS "employmentType",
+  employee_id AS "employeeId", contractor_sponsor AS "contractorSponsor",
+  contractor_start_date AS "contractorStartDate", contractor_end_date AS "contractorEndDate",
+  is_health_employee AS "isHealthEmployee", is_transportation_employee AS "isTransportationEmployee",
+  health_email AS "healthEmail", transportation_email AS "transportationEmail",
+  department_assignments AS "departmentAssignments", status
+FROM users WHERE status = 'ACTIVE'
 ```
 
-## Get Specific User
+## Get Specific User — full profile
 
 ```sql
-SELECT user_id AS "id", username AS "userName", email, first_name AS "givenName", last_name AS "familyName", display_name AS "displayName", department, title, status FROM users WHERE user_id = ?
+SELECT user_id AS "id", username AS "userName", email,
+  first_name AS "givenName", last_name AS "familyName", display_name AS "displayName",
+  middle_name AS "middleName", nick_name AS "nickName", second_email AS "secondEmail",
+  mobile_phone AS "mobilePhone", primary_phone AS "primaryPhone",
+  street_address AS "streetAddress", city, state, zip_code AS "zipCode", country_code AS "countryCode",
+  department, title, user_type AS "userType", cost_center AS "costCenter",
+  organization, division, employee_number AS "employeeNumber", manager_id AS "managerId",
+  agency_name AS "agencyName", start_date AS "startDate", employment_type AS "employmentType",
+  employee_id AS "employeeId", contractor_sponsor AS "contractorSponsor",
+  contractor_start_date AS "contractorStartDate", contractor_end_date AS "contractorEndDate",
+  is_health_employee AS "isHealthEmployee", is_transportation_employee AS "isTransportationEmployee",
+  health_email AS "healthEmail", transportation_email AS "transportationEmail",
+  department_assignments AS "departmentAssignments", status
+FROM users WHERE user_id = ?
 ```
+
+> **Note on `departmentAssignments`:** stored as a JSON-array string (e.g. `["Department of Health","Department of Transportation"]`). The Okta attribute is an array; the generic DB connector returns it as a single string, so you may need to keep the Okta attribute as a string, or split it in a transform. Flagged for the multi-agency (Lisa Park) scenario.
 
 ## Create User
 
