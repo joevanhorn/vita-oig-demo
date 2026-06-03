@@ -1,0 +1,157 @@
+name: Deploy Generic DB Connector (HR System)
+
+# Deploys the "HR System" Generic Database Connector infrastructure to AWS:
+#   - stack=generic-db : PostgreSQL RDS + dedicated VPC + Secrets Manager
+#   - stack=opc        : OPC agent EC2 host that bridges Okta to the database
+#
+# Order matters: deploy `generic-db` first (the `opc` stack reads its remote
+# state for the DB endpoint / VPC), then deploy `opc`.
+#
+# Follows the same GitOps + AWS OIDC pattern as deploy-scim-server.yml.
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment (matches environments/ directory and GitHub Environment)'
+        required: true
+        type: choice
+        default: vita-oig-preview
+        options:
+          - vita-oig-preview
+      stack:
+        description: 'Which stack to deploy'
+        required: true
+        type: choice
+        default: generic-db
+        options:
+          - generic-db
+          - opc
+      action:
+        description: 'Terraform action'
+        required: true
+        type: choice
+        default: plan
+        options:
+          - plan
+          - apply
+          - destroy
+      instance_type:
+        description: 'OPC agent EC2 instance type (opc stack only)'
+        required: false
+        type: choice
+        default: 't3.medium'
+        options:
+          - t3.small
+          - t3.medium
+          - t3.large
+
+permissions:
+  id-token: write   # Required for AWS OIDC
+  contents: read
+
+jobs:
+  deploy:
+    name: Terraform ${{ github.event.inputs.action }} - ${{ github.event.inputs.stack }}
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ github.event.inputs.environment }}
+
+    defaults:
+      run:
+        working-directory: environments/${{ github.event.inputs.environment }}/${{ github.event.inputs.stack == 'generic-db' && 'generic-db-infrastructure' || 'opc-infrastructure' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: GitHubActions-GenericDB-Deploy
+          aws-region: ${{ secrets.AWS_REGION || 'us-east-1' }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~> 1.9.0"
+
+      - name: Compose Okta org URL (opc stack)
+        id: okta
+        if: github.event.inputs.stack == 'opc'
+        run: |
+          ORG="${{ secrets.OKTA_ORG_NAME }}"
+          BASE="${{ secrets.OKTA_BASE_URL }}"
+          if [ -n "$ORG" ] && [ -n "$BASE" ]; then
+            echo "url=https://$ORG.$BASE" >> $GITHUB_OUTPUT
+          else
+            echo "url=" >> $GITHUB_OUTPUT
+            echo "::warning::OKTA_ORG_NAME / OKTA_BASE_URL not set; okta_org_url will be empty (only affects a connectivity self-test)."
+          fi
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      - name: Terraform Plan
+        if: github.event.inputs.action == 'plan' || github.event.inputs.action == 'apply'
+        env:
+          TF_VAR_okta_org_url: ${{ steps.okta.outputs.url }}
+          TF_VAR_instance_type: ${{ github.event.inputs.instance_type }}
+        run: |
+          terraform plan -out=tfplan
+
+          echo "## 📋 Terraform Plan - ${{ github.event.inputs.stack }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment:** ${{ github.event.inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Stack:** ${{ github.event.inputs.stack }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Action:** ${{ github.event.inputs.action }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Review the plan output above before applying." >> $GITHUB_STEP_SUMMARY
+
+      - name: Terraform Apply
+        if: github.event.inputs.action == 'apply'
+        env:
+          TF_VAR_okta_org_url: ${{ steps.okta.outputs.url }}
+          TF_VAR_instance_type: ${{ github.event.inputs.instance_type }}
+        run: |
+          terraform apply -auto-approve tfplan
+
+          echo "## ✅ ${{ github.event.inputs.stack }} deployed" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          terraform output >> $GITHUB_STEP_SUMMARY 2>&1 || true
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: Next steps (generic-db apply)
+        if: github.event.inputs.action == 'apply' && github.event.inputs.stack == 'generic-db'
+        run: |
+          echo "### ⏭️ Next Steps" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "1. Initialize the HR schema + seed data:" >> $GITHUB_STEP_SUMMARY
+          echo '   ```bash' >> $GITHUB_STEP_SUMMARY
+          echo "   environments/${{ github.event.inputs.environment }}/generic-db-infrastructure/scripts/setup.sh" >> $GITHUB_STEP_SUMMARY
+          echo '   ```' >> $GITHUB_STEP_SUMMARY
+          echo "2. Deploy the OPC agent: re-run this workflow with **stack=opc, action=apply**." >> $GITHUB_STEP_SUMMARY
+
+      - name: Next steps (opc apply)
+        if: github.event.inputs.action == 'apply' && github.event.inputs.stack == 'opc'
+        run: |
+          echo "### ⏭️ Next Steps" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "1. Connect to the agent via the SSM command in the outputs above (allow ~5-10 min for bootstrap)." >> $GITHUB_STEP_SUMMARY
+          echo "2. Install the Okta Provisioning Agent + Generic DB connector (see /installers/SETUP.md on the host)." >> $GITHUB_STEP_SUMMARY
+          echo "3. Create the 'On-prem Connector for Generic Databases' app in Okta and configure the SQL queries (SQL_QUERIES.md)." >> $GITHUB_STEP_SUMMARY
+
+      - name: Terraform Destroy
+        if: github.event.inputs.action == 'destroy'
+        env:
+          TF_VAR_okta_org_url: ${{ steps.okta.outputs.url }}
+          TF_VAR_instance_type: ${{ github.event.inputs.instance_type }}
+        run: |
+          terraform destroy -auto-approve
+
+          echo "## 🗑️ ${{ github.event.inputs.stack }} destroyed" >> $GITHUB_STEP_SUMMARY
