@@ -28,7 +28,7 @@ on:
           - generic-db
           - opc
       action:
-        description: 'Terraform action'
+        description: 'Action (init-schema = load HR schema into the DB; generic-db only)'
         required: true
         type: choice
         default: plan
@@ -36,6 +36,7 @@ on:
           - plan
           - apply
           - destroy
+          - init-schema
       instance_type:
         description: 'OPC agent EC2 instance type (opc stack only)'
         required: false
@@ -95,6 +96,26 @@ jobs:
 
       - name: Terraform Validate
         run: terraform validate
+
+      - name: Initialize HR schema
+        if: github.event.inputs.action == 'init-schema' && github.event.inputs.stack == 'generic-db'
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y postgresql-client jq -qq
+
+          SECRET=$(terraform output -raw credentials_secret)
+          CREDS=$(aws secretsmanager get-secret-value --secret-id "$SECRET" --region "${{ secrets.AWS_REGION || 'us-east-1' }}" --query SecretString --output text)
+          export PGPASSWORD="$(echo "$CREDS" | jq -r .password)"
+          HOST=$(echo "$CREDS" | jq -r .host)
+          DB=$(echo "$CREDS" | jq -r .database)
+          DBUSER=$(echo "$CREDS" | jq -r .username)
+
+          echo "Loading schema into $DB on $HOST ..."
+          psql -h "$HOST" -U "$DBUSER" -d "$DB" -v ON_ERROR_STOP=1 -f scripts/schema.sql
+
+          echo "## 🗄️ HR schema initialized" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          psql -h "$HOST" -U "$DBUSER" -d "$DB" -tA -c "SELECT 'users='||count(*) FROM users UNION ALL SELECT 'entitlements='||count(*) FROM entitlements UNION ALL SELECT 'assignments='||count(*) FROM user_entitlements;" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
 
       - name: Terraform Plan
         if: github.event.inputs.action == 'plan' || github.event.inputs.action == 'apply'
