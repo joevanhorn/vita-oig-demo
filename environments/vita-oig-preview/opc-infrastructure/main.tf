@@ -101,6 +101,24 @@ resource "aws_security_group" "opc_shared" {
 # OPC AGENT MODULES
 # ==============================================================================
 
+# Allow each agent to read the HR System DB credentials from Secrets Manager
+# (so the agent can self-fetch creds — no credentials ever pass through commands).
+resource "aws_iam_role_policy" "agent_read_db_secret" {
+  for_each = local.enabled_agents
+
+  name = "read-hr-db-secret"
+  role = element(split("/", module.opc_agents[each.key].iam_role_arn), 1)
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = ["secretsmanager:GetSecretValue"]
+      Resource = data.terraform_remote_state.generic_db.outputs.credentials_secret_arn
+    }]
+  })
+}
+
 module "opc_agents" {
   source   = "../../../modules/opc-agent"
   for_each = local.enabled_agents
