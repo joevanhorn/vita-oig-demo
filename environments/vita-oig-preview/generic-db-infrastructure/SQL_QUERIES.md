@@ -20,8 +20,7 @@ SELECT user_id AS "id", username AS "userName", email,
   employee_id AS "employeeId", contractor_sponsor AS "contractorSponsor",
   contractor_start_date AS "contractorStartDate", contractor_end_date AS "contractorEndDate",
   is_health_employee AS "isHealthEmployee", is_transportation_employee AS "isTransportationEmployee",
-  health_email AS "healthEmail", transportation_email AS "transportationEmail",
-  department_assignments AS "departmentAssignments", status
+  health_email AS "healthEmail", transportation_email AS "transportationEmail", status
 FROM users WHERE status = 'ACTIVE'
 ```
 
@@ -39,12 +38,11 @@ SELECT user_id AS "id", username AS "userName", email,
   employee_id AS "employeeId", contractor_sponsor AS "contractorSponsor",
   contractor_start_date AS "contractorStartDate", contractor_end_date AS "contractorEndDate",
   is_health_employee AS "isHealthEmployee", is_transportation_employee AS "isTransportationEmployee",
-  health_email AS "healthEmail", transportation_email AS "transportationEmail",
-  department_assignments AS "departmentAssignments", status
+  health_email AS "healthEmail", transportation_email AS "transportationEmail", status
 FROM users WHERE user_id = ?
 ```
 
-> **Note on `departmentAssignments`:** stored as a JSON-array string (e.g. `["Department of Health","Department of Transportation"]`). The Okta attribute is an array; the generic DB connector returns it as a single string, so you may need to keep the Okta attribute as a string, or split it in a transform. Flagged for the multi-agency (Lisa Park) scenario.
+> **Note on `departmentAssignments`:** intentionally **excluded** from the import query. The Okta attribute is an array, but the generic DB connector returns each column as a single string, which fails with a datatype error on import. The column still exists in the DB (`["Department of Health","Department of Transportation"]` for Lisa Park), but multi-agency membership is imported via the `isHealthEmployee` / `isTransportationEmployee` booleans + the `*Email` fields instead. Re-add the column only if you map the Okta attribute as a string or add a split transform.
 
 ## Create User
 
