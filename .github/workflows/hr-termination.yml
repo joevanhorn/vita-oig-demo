@@ -1,0 +1,178 @@
+name: "VITA: HR Termination (single user)"
+
+# Demo control workflow for the Generic DB Connector "leaver" story.
+# It changes ONLY the HR database (the source of truth). Okta reacts on the next
+# FULL import: a terminated user drops out of the ACTIVE feed, so Okta deactivates
+# them and OIG revokes their access. No Okta API calls here — the hand-built org
+# is never touched directly.
+#
+# Actions:
+#   list-active-users : print the ACTIVE users so you can find a `target`
+#   terminate         : set <target> INACTIVE + revoke their entitlements (deactivate_user)
+#   reactivate        : undo a termination (reset for re-running the demo)
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "What to do"
+        required: true
+        type: choice
+        default: list-active-users
+        options:
+          - list-active-users
+          - terminate
+          - reactivate
+      target:
+        description: "User to terminate/reactivate — user_id, username, or email (ignored for list)"
+        required: false
+        type: string
+      dry_run:
+        description: "Show the change without committing it"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  hr-lifecycle:
+    name: "HR ${{ inputs.action }}${{ inputs.target && format(' — {0}', inputs.target) || '' }}"
+    runs-on: ubuntu-latest
+    environment:
+      name: vita-oig-preview
+
+    env:
+      AWS_REGION: ${{ secrets.AWS_REGION || 'us-east-1' }}
+      DB_SECRET: vita-oig-preview-use1-generic-db-credentials
+      DB_SG_ID: sg-0a6bd17417e642b44
+
+    steps:
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: GitHubActions-VITA-HR
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install PostgreSQL client
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client jq
+
+      - name: Open DB security group for this runner
+        id: sg
+        run: |
+          RUNNER_IP=$(curl -s https://checkip.amazonaws.com)
+          RULE_ID=$(aws ec2 authorize-security-group-ingress --region "$AWS_REGION" \
+            --group-id "$DB_SG_ID" --protocol tcp --port 5432 --cidr "${RUNNER_IP}/32" \
+            --query 'SecurityGroupRules[0].SecurityGroupRuleId' --output text 2>/dev/null) || true
+          echo "rule_id=$RULE_ID" >> "$GITHUB_OUTPUT"
+          echo "Opened 5432 from ${RUNNER_IP}/32 (rule: ${RULE_ID:-already-present})"
+
+      - name: Fetch DB credentials
+        id: creds
+        run: |
+          CREDS=$(aws secretsmanager get-secret-value --secret-id "$DB_SECRET" \
+            --region "$AWS_REGION" --query SecretString --output text)
+          echo "::add-mask::$(echo "$CREDS" | jq -r '.password')"
+          {
+            echo "host=$(echo "$CREDS" | jq -r '.host')"
+            echo "port=$(echo "$CREDS" | jq -r '.port')"
+            echo "db=$(echo "$CREDS" | jq -r '.database')"
+            echo "user=$(echo "$CREDS" | jq -r '.username')"
+            echo "pass=$(echo "$CREDS" | jq -r '.password')"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: List active users
+        if: inputs.action == 'list-active-users'
+        env:
+          PGPASSWORD: ${{ steps.creds.outputs.pass }}
+        run: |
+          DB="-h ${{ steps.creds.outputs.host }} -p ${{ steps.creds.outputs.port }} -U ${{ steps.creds.outputs.user }} -d ${{ steps.creds.outputs.db }}"
+          echo "=== ACTIVE users (use one of these as the 'target') ==="
+          psql $DB -c "SELECT user_id, username, email, department, status FROM users WHERE status='ACTIVE' ORDER BY username;"
+          {
+            echo "## Active users"
+            echo '```'
+            psql $DB -t -c "SELECT rpad(user_id,14)||rpad(username,18)||email FROM users WHERE status='ACTIVE' ORDER BY username;"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Terminate user
+        if: inputs.action == 'terminate'
+        env:
+          PGPASSWORD: ${{ steps.creds.outputs.pass }}
+        run: |
+          DB="-h ${{ steps.creds.outputs.host }} -p ${{ steps.creds.outputs.port }} -U ${{ steps.creds.outputs.user }} -d ${{ steps.creds.outputs.db }}"
+          TARGET="${{ inputs.target }}"
+          if [ -z "$TARGET" ]; then echo "::error::'target' is required for terminate"; exit 1; fi
+          if ! printf '%s' "$TARGET" | grep -Eq '^[A-Za-z0-9@._-]+$'; then echo "::error::invalid target '$TARGET'"; exit 1; fi
+
+          USERID=$(psql $DB -tAc "SELECT user_id FROM users WHERE user_id='$TARGET' OR lower(username)=lower('$TARGET') OR lower(email)=lower('$TARGET') LIMIT 1" | xargs)
+          if [ -z "$USERID" ]; then echo "::error::no user matches '$TARGET'"; exit 1; fi
+          echo "Resolved '$TARGET' -> user_id=$USERID"
+
+          echo "=== BEFORE ==="
+          psql $DB -c "SELECT user_id, username, email, status, deactivated_at FROM users WHERE user_id='$USERID';"
+          psql $DB -c "SELECT entitlement_id, status FROM user_entitlements WHERE user_id='$USERID' ORDER BY entitlement_id;"
+
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "DRY RUN — would call deactivate_user('$USERID') (status->INACTIVE, entitlements->REVOKED). No changes made."
+          else
+            psql $DB -c "SELECT deactivate_user('$USERID');"
+            echo "=== AFTER ==="
+            psql $DB -c "SELECT user_id, username, email, status, deactivated_at FROM users WHERE user_id='$USERID';"
+            psql $DB -c "SELECT entitlement_id, status, revoked_by FROM user_entitlements WHERE user_id='$USERID' ORDER BY entitlement_id;"
+          fi
+
+      - name: Reactivate user
+        if: inputs.action == 'reactivate'
+        env:
+          PGPASSWORD: ${{ steps.creds.outputs.pass }}
+        run: |
+          DB="-h ${{ steps.creds.outputs.host }} -p ${{ steps.creds.outputs.port }} -U ${{ steps.creds.outputs.user }} -d ${{ steps.creds.outputs.db }}"
+          TARGET="${{ inputs.target }}"
+          if [ -z "$TARGET" ]; then echo "::error::'target' is required for reactivate"; exit 1; fi
+          if ! printf '%s' "$TARGET" | grep -Eq '^[A-Za-z0-9@._-]+$'; then echo "::error::invalid target '$TARGET'"; exit 1; fi
+
+          USERID=$(psql $DB -tAc "SELECT user_id FROM users WHERE user_id='$TARGET' OR lower(username)=lower('$TARGET') OR lower(email)=lower('$TARGET') LIMIT 1" | xargs)
+          if [ -z "$USERID" ]; then echo "::error::no user matches '$TARGET'"; exit 1; fi
+          echo "Resolved '$TARGET' -> user_id=$USERID"
+
+          echo "=== BEFORE ==="
+          psql $DB -c "SELECT user_id, username, status, deactivated_at FROM users WHERE user_id='$USERID';"
+
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "DRY RUN — would set status->ACTIVE and restore entitlements revoked by the termination. No changes made."
+          else
+            # Mirror/undo deactivate_user: reactivate the user and restore the entitlements
+            # the termination revoked (revoked_by='okta'), leaving any other revocations alone.
+            psql $DB -c "UPDATE users SET status='ACTIVE', deactivated_at=NULL WHERE user_id='$USERID';"
+            psql $DB -c "UPDATE user_entitlements SET status='ACTIVE', revoked_at=NULL, revoked_by=NULL WHERE user_id='$USERID' AND status='REVOKED' AND revoked_by='okta';"
+            psql $DB -c "INSERT INTO audit_log (operation, entity_type, entity_id, performed_by, source) VALUES ('REACTIVATE','USER','$USERID','github-actions','HR');"
+            echo "=== AFTER ==="
+            psql $DB -c "SELECT user_id, username, status, deactivated_at FROM users WHERE user_id='$USERID';"
+            psql $DB -c "SELECT entitlement_id, status FROM user_entitlements WHERE user_id='$USERID' ORDER BY entitlement_id;"
+          fi
+
+      - name: "NEXT: run the Okta import"
+        if: inputs.action != 'list-active-users' && inputs.dry_run != true
+        run: |
+          echo "::notice title=NEXT STEP — RUN THE OKTA IMPORT::Okta Admin > Applications > Cardinal HR System (PeopleSoft) > Import > Import Now > Confirm Assignments. The HR change won't appear in Okta until a FULL import runs."
+          {
+            echo "## ▶ NEXT: Run the Okta import (required)"
+            echo ""
+            echo "The HR database was updated, but **nothing changes in Okta until you import.**"
+            echo ""
+            echo "**Okta Admin → Applications → Cardinal HR System (PeopleSoft) → Import → Import Now → Confirm Assignments**"
+            echo ""
+            echo "> ⚠️ The Generic DB connector only supports **full** imports — an incremental import will miss the change."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Close DB security group
+        if: always() && steps.sg.outputs.rule_id != '' && steps.sg.outputs.rule_id != 'None'
+        run: |
+          aws ec2 revoke-security-group-ingress --region "$AWS_REGION" \
+            --group-id "$DB_SG_ID" --security-group-rule-ids "${{ steps.sg.outputs.rule_id }}" || true
+          echo "Closed SG rule ${{ steps.sg.outputs.rule_id }}"
