@@ -43,6 +43,13 @@ COLUMNS = [
     ("u_okta_group_type", "Okta Group Type", "string", 40),
     ("u_last_sync", "Last Sync", "glide_date_time", 40),
 ]
+CATALOG_TABLE = "u_okta_requestable"
+CATALOG_COLUMNS = [
+    ("u_entry_id", "Okta Catalog Entry ID", "string", 100),
+    ("u_name", "Name", "string", 255),
+    ("u_description", "Description", "string", 1000),
+    ("u_last_sync", "Last Sync", "glide_date_time", 40),
+]
 FLOW1_ITEM = "Okta Group Access (Okta-approved)"
 FLOW2_ITEM = "Okta Group Access (Manager approval)"
 
@@ -73,19 +80,27 @@ def _patch(table, sys_id, body):
 
 
 # --------------------------------------------------------------------------- table
-def setup_table():
-    print(f"[table] ensuring {TABLE}")
-    if _get("sys_db_object", f"name={TABLE}"):
+def _ensure_table(table, label, columns):
+    print(f"[table] ensuring {table}")
+    if _get("sys_db_object", f"name={table}"):
         print("   table exists")
     else:
-        print(f"   created table (sys_id={_post('sys_db_object', {'name': TABLE, 'label': 'Okta Groups'})['sys_id']})")
-    for element, label, itype, maxlen in COLUMNS:
-        if _get("sys_dictionary", f"name={TABLE}^element={element}"):
+        print(f"   created table (sys_id={_post('sys_db_object', {'name': table, 'label': label})['sys_id']})")
+    for element, clabel, itype, maxlen in columns:
+        if _get("sys_dictionary", f"name={table}^element={element}"):
             continue
-        _post("sys_dictionary", {"name": TABLE, "element": element, "column_label": label,
+        _post("sys_dictionary", {"name": table, "element": element, "column_label": clabel,
                                  "internal_type": itype, "max_length": maxlen, "active": "true",
                                  "display": "true" if element == "u_name" else "false"})
         print(f"   created column {element}")
+
+
+def setup_table():
+    _ensure_table(TABLE, "Okta Groups", COLUMNS)
+
+
+def setup_catalog_table():
+    _ensure_table(CATALOG_TABLE, "Okta Requestable", CATALOG_COLUMNS)
 
 
 # ---------------------------------------------------------------------- properties
@@ -254,8 +269,8 @@ def setup_business_rules():
         f"&& current.approval.changes()")
 
 
-STEPS = {"table": setup_table, "properties": setup_properties, "script_include": setup_script_include,
-         "catalog": setup_catalog, "business_rules": setup_business_rules}
+STEPS = {"table": setup_table, "catalog_table": setup_catalog_table, "properties": setup_properties,
+         "script_include": setup_script_include, "catalog": setup_catalog, "business_rules": setup_business_rules}
 
 
 def main():

@@ -42,6 +42,7 @@ BRIDGE_SECRET_NAME = os.environ.get("BRIDGE_SECRET_NAME", "").strip()
 SN_TABLE = os.environ.get("SN_TABLE", "x_okta_groups").strip()
 GROUP_SYNC_FILTER = os.environ.get("GROUP_SYNC_FILTER", 'type eq "OKTA_GROUP"').strip()
 JUSTIFICATION_FIELD_ID = os.environ.get("JUSTIFICATION_FIELD_ID", "").strip()
+SN_CATALOG_TABLE = os.environ.get("SN_CATALOG_TABLE", "u_okta_requestable").strip()
 
 _secret_cache = None
 
@@ -208,6 +209,50 @@ def flow3_sync_groups():
     return _json(200, {"groups": len(groups), "synced": synced, "errors": errors})
 
 
+def _okta_gov_paginate(path, params=None):
+    """GET a governance v2 list ({data:[...], _links.next.href}), following next."""
+    out = []
+    url = f"{OKTA_ORG_URL}{path}"
+    if params:
+        url += "?" + urllib.parse.urlencode(params, quote_via=urllib.parse.quote)
+    h = {"Authorization": f"SSWS {_secret()['okta_token']}", "Accept": "application/json"}
+    while url:
+        status, data, _ = _http("GET", url, h)
+        logger.info("OKTA GET %s -> %s", url, status)
+        if status >= 300 or not isinstance(data, dict):
+            break
+        out.extend(data.get("data", []))
+        url = (((data.get("_links") or {}).get("next") or {}).get("href"))
+    return out
+
+
+def flow_sync_catalog():
+    """Upsert REQUESTABLE OIG catalog entries (apps/groups with a request condition) into the
+    SN catalog table, so anything made requestable in Okta auto-appears for Flow 1 with its
+    catalog entry id."""
+    entries = _okta_gov_paginate("/governance/api/v2/catalogs/default/entries",
+                                 {"filter": "name pr", "limit": 200})
+    req = [e for e in entries if e.get("requestable")]
+    now = datetime.now(timezone.utc).isoformat()
+    synced = errors = 0
+    for e in req:
+        eid = e.get("id")
+        row = {"u_entry_id": eid, "u_name": e.get("name", ""),
+               "u_description": e.get("description") or "", "u_last_sync": now}
+        st, data = _sn("GET", f"/api/now/table/{SN_CATALOG_TABLE}",
+                       params={"sysparm_query": f"u_entry_id={eid}", "sysparm_limit": 1,
+                               "sysparm_fields": "sys_id"})
+        existing = (data or {}).get("result") if isinstance(data, dict) else None
+        if st < 300 and existing:
+            ust, _ = _sn("PATCH", f"/api/now/table/{SN_CATALOG_TABLE}/{existing[0]['sys_id']}", body=row)
+        else:
+            ust, _ = _sn("POST", f"/api/now/table/{SN_CATALOG_TABLE}", body=row)
+        synced += 1 if ust < 300 else 0
+        errors += 0 if ust < 300 else 1
+    logger.info("catalog sync: %d entries, %d requestable, %d ok, %d errors", len(entries), len(req), synced, errors)
+    return _json(200, {"entries": len(entries), "requestable": len(req), "synced": synced, "errors": errors})
+
+
 # ---------------------------------------------------------------------------
 # Handler / routing
 # ---------------------------------------------------------------------------
@@ -216,7 +261,9 @@ def handler(event, context):
     http = (event.get("requestContext") or {}).get("http")
     if not http:
         if event.get("source") == "aws.events" or event.get("scheduled"):
-            return flow3_sync_groups()
+            g = json.loads(flow3_sync_groups()["body"])
+            c = json.loads(flow_sync_catalog()["body"])
+            return _json(200, {"groups": g, "catalog": c})
         return _json(400, {"error": "unrecognized event"})
 
     method, path = http.get("method", "GET"), event.get("rawPath", "/")
@@ -247,6 +294,8 @@ def handler(event, context):
             return flow2_approved(body)
         if method == "POST" and path == "/sync/groups":
             return flow3_sync_groups()
+        if method == "POST" and path == "/sync/catalog":
+            return flow_sync_catalog()
         return _json(404, {"error": f"no route for {method} {path}"})
     except Exception as e:  # noqa
         logger.exception("handler error")
