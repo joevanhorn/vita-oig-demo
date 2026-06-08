@@ -118,7 +118,7 @@ resource "aws_cloudwatch_event_rule" "sync" {
   name                = "${var.name}-group-sync"
   description         = "Periodic Okta->ServiceNow group sync"
   schedule_expression = var.sync_schedule
-  tags                = var.tags
+  # No tags: the CI role lacks events:TagResource (PutRule without tags is allowed).
 }
 
 resource "aws_cloudwatch_event_target" "sync" {
