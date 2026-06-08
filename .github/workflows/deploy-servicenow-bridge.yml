@@ -1,0 +1,100 @@
+name: Deploy ServiceNow-Okta Bridge
+
+# Deploys the SN<->Okta bridge (Lambda + API Gateway + EventBridge) and populates its
+# Secrets Manager secret from GitHub Environment secrets. Mirrors deploy patterns in this repo.
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "GitHub Environment (Okta org + AWS OIDC role)"
+        required: true
+        default: vita-oig-preview
+        type: string
+      action:
+        description: "Terraform action"
+        required: true
+        default: plan
+        type: choice
+        options: [plan, apply, destroy]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy:
+    name: "SN-Okta Bridge - ${{ inputs.action }}"
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ inputs.environment }}
+    defaults:
+      run:
+        working-directory: environments/${{ inputs.environment }}/infrastructure/servicenow-okta-bridge
+    env:
+      TF_VAR_environment: ${{ inputs.environment }}
+      TF_VAR_aws_region: us-east-1
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: GitHubActions-SNOktaBridge
+          aws-region: us-east-1
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~> 1.9"
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      - name: Terraform Plan
+        if: inputs.action == 'plan' || inputs.action == 'apply'
+        run: terraform plan -out=tfplan
+
+      - name: Terraform Apply
+        if: inputs.action == 'apply'
+        run: terraform apply -auto-approve tfplan
+
+      - name: Populate bridge secret
+        if: inputs.action == 'apply'
+        env:
+          OKTA_API_TOKEN: ${{ secrets.OKTA_API_TOKEN }}
+          OKTA_BASE_URL: ${{ secrets.OKTA_BASE_URL }}
+          OKTA_ORG_NAME: ${{ secrets.OKTA_ORG_NAME }}
+          SERVICENOW_URL: ${{ secrets.SERVICENOW_URL }}
+          SERVICENOW_USER: ${{ secrets.SERVICENOW_USER }}
+          SERVICENOW_PASS: ${{ secrets.SERVICENOW_PASS }}
+          SN_INBOUND_SECRET: ${{ secrets.SN_INBOUND_SECRET }}
+        run: |
+          SECRET=$(terraform output -raw secret_name)
+          if [ -n "$OKTA_API_TOKEN" ] && [ -n "$SERVICENOW_URL" ] && [ -n "$SERVICENOW_USER" ] && [ -n "$SERVICENOW_PASS" ] && [ -n "$SN_INBOUND_SECRET" ]; then
+            aws secretsmanager put-secret-value --secret-id "$SECRET" --secret-string "$(jq -nc \
+              --arg t "$OKTA_API_TOKEN" --arg u "$SERVICENOW_URL" --arg su "$SERVICENOW_USER" \
+              --arg sp "$SERVICENOW_PASS" --arg ib "$SN_INBOUND_SECRET" \
+              '{okta_token:$t, sn_base_url:$u, sn_user:$su, sn_pass:$sp, inbound_secret:$ib}')" >/dev/null
+            echo "Populated $SECRET from GitHub Environment secrets."
+          else
+            echo "::warning::Set env secrets OKTA_API_TOKEN, SERVICENOW_URL/USER/PASS, SN_INBOUND_SECRET, then re-run apply (or populate $SECRET manually)."
+          fi
+
+      - name: Summary
+        if: inputs.action == 'apply'
+        run: |
+          {
+            echo "## ServiceNow-Okta Bridge deployed"
+            echo "- Base URL (ServiceNow calls this): \`$(terraform output -raw bridge_base_url)\`"
+            echo "- Routes: POST /servicenow/request, POST /servicenow/approved, POST /sync/groups, GET /healthz"
+            echo "- ServiceNow sends header \`x-bridge-secret: <SN_INBOUND_SECRET>\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Terraform Destroy
+        if: inputs.action == 'destroy'
+        run: terraform destroy -auto-approve
