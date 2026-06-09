@@ -152,10 +152,17 @@ def flow1_request(body):
     req = {"requested": {"type": "CATALOG_ENTRY", "entryId": entry_id},
            "requestedFor": {"type": "OKTA_USER", "externalId": uid}}
     rfv = body.get("requester_field_values")
+    if not rfv:
+        # Auto-fill the entry's REQUIRED request fields (e.g. business justification) so the
+        # ServiceNow side only has to pass justification text, not Okta field ids.
+        just = body.get("justification") or "Requested via ServiceNow"
+        fst, fields = _okta("GET", f"/governance/api/v2/my/catalogs/default/entries/{entry_id}/request-fields")
+        rfv = [{"id": f["id"], "values": [just]}
+               for f in (fields or {}).get("data", []) if f.get("required")] if fst < 300 else []
+        if JUSTIFICATION_FIELD_ID and not any(x["id"] == JUSTIFICATION_FIELD_ID for x in rfv):
+            rfv.append({"id": JUSTIFICATION_FIELD_ID, "values": [just]})
     if rfv:
         req["requesterFieldValues"] = rfv
-    elif body.get("justification") and JUSTIFICATION_FIELD_ID:
-        req["requesterFieldValues"] = [{"id": JUSTIFICATION_FIELD_ID, "values": [body["justification"]]}]
     status, data = _okta("POST", "/governance/api/v2/requests", body=req)
     if status >= 300:
         return _json(status, {"error": "okta request failed", "okta": data})
@@ -230,8 +237,14 @@ def flow_sync_catalog():
     """Upsert REQUESTABLE OIG catalog entries (apps/groups with a request condition) into the
     SN catalog table, so anything made requestable in Okta auto-appears for Flow 1 with its
     catalog entry id."""
-    entries = _okta_gov_paginate("/governance/api/v2/catalogs/default/entries",
-                                 {"filter": "name pr", "limit": 200})
+    # The end-user ("my") catalog reflects accurate requestable flags; the requestable item is
+    # usually a CHILD entry (the group within an app, when access scope = GROUPS). Collect
+    # requestable parents + their children.
+    base = "/governance/api/v2/my/catalogs/default/entries"
+    parents = _okta_gov_paginate(base, {"filter": "not(parent pr)", "limit": 200})
+    entries = list(parents)
+    for p in parents:
+        entries.extend(_okta_gov_paginate(base, {"filter": f'parent eq "{p.get("id")}"', "limit": 200}))
     req = [e for e in entries if e.get("requestable")]
     now = datetime.now(timezone.utc).isoformat()
     synced = errors = 0
