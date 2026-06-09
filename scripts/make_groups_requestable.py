@@ -64,32 +64,36 @@ def call(method, path, body=None):
 
 
 def make_requestable(g):
+    """Create the request condition (if missing) and ACTIVATE it. Conditions are created
+    status=INACTIVE, so the activate step is required."""
     name = f"Request {g['name']}"
-    # skip if a matching condition already exists on the app
     st, conds = call("GET", f"/governance/api/v2/resources/{g['app_id']}/request-conditions?limit=50")
-    if st < 300 and any(c.get("name") == name for c in (conds or {}).get("data", [])):
-        print(f"   {g['name']}: request condition exists")
-        return
-    body = {
-        "name": name,
-        "requesterSettings": {"type": "EVERYONE"},
-        "accessScopeSettings": {"type": "GROUPS", "groups": [{"id": g["group_id"]}]},
-        "approvalSequenceId": SEQ,
-    }
-    st, data = call("POST", f"/governance/api/v2/resources/{g['app_id']}/request-conditions", body)
-    if st >= 300:
-        print(f"   {g['name']}: FAILED {st} {data}")
-        return
-    print(f"   {g['name']}: request condition created ({(data or {}).get('id')})")
+    cond = next((c for c in (conds or {}).get("data", []) if c.get("name") == name), None) if st < 300 else None
+    if not cond:
+        body = {
+            "name": name,
+            "requesterSettings": {"type": "EVERYONE"},
+            "accessScopeSettings": {"type": "GROUPS", "groups": [{"id": g["group_id"]}]},
+            "approvalSequenceId": SEQ,
+        }
+        st, cond = call("POST", f"/governance/api/v2/resources/{g['app_id']}/request-conditions", body)
+        if st >= 300:
+            print(f"   {g['name']}: create FAILED {st} {cond}")
+            return
+        print(f"   {g['name']}: condition created ({cond.get('id')})")
+    else:
+        print(f"   {g['name']}: condition exists ({cond.get('id')}, status {cond.get('status')})")
+    if cond.get("status") != "ACTIVE":
+        ast, _ = call("POST", f"/governance/api/v2/resources/{g['app_id']}/request-conditions/{cond['id']}/activate")
+        print(f"   {g['name']}: activate -> HTTP {ast}")
 
 
-def find_entry_id(g):
-    # the catalog entry that became requestable for this group
+def list_entries():
+    """The catalog entry created is the APP entry (e.g. 'Health App') — that's the Flow 1 target."""
     st, data = call("GET", "/governance/api/v2/catalogs/default/entries?filter=" +
-                    urllib.parse.quote(f'name eq "{g["name"]}"') + "&limit=1")
-    entries = (data or {}).get("data", []) if st < 300 else []
-    eid = entries[0]["id"] if entries else "(not found yet)"
-    print(f"   {g['name']} -> catalog entry: {eid}")
+                    urllib.parse.quote("name pr") + "&limit=100")
+    for e in (data or {}).get("data", []):
+        print(f"   requestable={e.get('requestable')} {e.get('id')} {e.get('name')}")
 
 
 def main():
@@ -99,9 +103,8 @@ def main():
     print("[request-conditions] making APP-*-Admin groups requestable")
     for g in GROUPS:
         make_requestable(g)
-    print("[catalog entries] (use one for x_okta_bridge.flow1_entry_id)")
-    for g in GROUPS:
-        find_entry_id(g)
+    print("[catalog entries] (the APP entry is the Flow 1 target)")
+    list_entries()
 
 
 if __name__ == "__main__":
