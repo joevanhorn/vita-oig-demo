@@ -202,9 +202,12 @@ def setup_catalog():
                      (FLOW2_ITEM, "Request Okta group access; approved in ServiceNow, provisioned in Okta.")]:
         item_id = _ensure_item(name, sd, catalog_id, category_id)
         _ensure_variable(item_id, "requested_for", "Requested for", 8, 100, "sys_user")
-        _ensure_variable(item_id, "okta_group", "Okta group", 8, 200, TABLE)
         if name == FLOW1_ITEM:
+            # Flow 1 picks a REQUESTABLE OIG item (synced child entries) -> its catalog entry id
+            _ensure_variable(item_id, "okta_requestable", "Requestable access", 8, 200, CATALOG_TABLE)
             _ensure_variable(item_id, "justification", "Business justification", 6, 300)
+        else:
+            _ensure_variable(item_id, "okta_group", "Okta group", 8, 200, TABLE)
 
 
 # ------------------------------------------------------------------ business rules
@@ -212,9 +215,10 @@ BR1 = """(function executeRule(current, previous) {
     try {
         var user = new GlideRecord('sys_user');
         if (!user.get(current.variables.requested_for)) return;
-        var entry = current.variables.okta_catalog_entry_id
-            ? current.variables.okta_catalog_entry_id.toString()
-            : gs.getProperty('x_okta_bridge.flow1_entry_id');
+        var entry = '';
+        var rec = new GlideRecord('u_okta_requestable');
+        if (rec.get(current.variables.okta_requestable)) entry = rec.u_entry_id.toString();
+        if (!entry) entry = gs.getProperty('x_okta_bridge.flow1_entry_id');
         new OktaBridge().post('/servicenow/request', {
             ritm_sys_id: current.getUniqueValue(),
             requested_for: { email: user.email.toString() },
@@ -239,17 +243,17 @@ BR2 = """(function executeRule(current, previous) {
 })(current, previous);"""
 
 
-def _ensure_business_rule(name, when, script, condition):
+def _ensure_business_rule(name, when, script, condition, on_insert, on_update):
     rec = _get("sys_script", f"name={name}")
-    body = {"name": name, "collection": "sc_req_item", "when": when, "active": "true",
-            "order": "200", "advanced": "true", "script": script, "condition": condition,
-            "action_insert": "true" if when == "after" else "false",
-            "action_update": "true"}
+    fields = {"collection": "sc_req_item", "when": when, "active": "true", "order": "200",
+              "advanced": "true", "script": script, "condition": condition,
+              "action_insert": "true" if on_insert else "false",
+              "action_update": "true" if on_update else "false"}
     if rec:
-        _patch("sys_script", rec["sys_id"], {"script": script, "condition": condition, "active": "true"})
+        _patch("sys_script", rec["sys_id"], fields)
         print(f"   business rule updated: {name}")
     else:
-        _post("sys_script", body)
+        _post("sys_script", {"name": name, **fields})
         print(f"   business rule created: {name}")
 
 
@@ -259,14 +263,15 @@ def setup_business_rules():
     f2 = _get("sc_cat_item", f"name={FLOW2_ITEM}")
     if not f1 or not f2:
         sys.exit("run the catalog step first (catalog items missing)")
+    # Flow 1: fire once, on submit (insert only) -> create the OIG access request
     _ensure_business_rule(
         "Okta Bridge - Flow1 submit", "after", BR1,
-        f"current.cat_item == '{f1['sys_id']}'")
-    # Flow 2: fire when the RITM approval flips to approved
+        f"current.cat_item == '{f1['sys_id']}'", on_insert=True, on_update=False)
+    # Flow 2: fire when the RITM approval flips to approved (update only)
     _ensure_business_rule(
         "Okta Bridge - Flow2 approved", "async", BR2,
         f"current.cat_item == '{f2['sys_id']}' && current.approval == 'approved' "
-        f"&& current.approval.changes()")
+        f"&& current.approval.changes()", on_insert=False, on_update=True)
 
 
 STEPS = {"table": setup_table, "catalog_table": setup_catalog_table, "properties": setup_properties,
