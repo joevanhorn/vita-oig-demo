@@ -86,6 +86,10 @@ def make_requestable(g):
     if cond.get("status") != "ACTIVE":
         ast, _ = call("POST", f"/governance/api/v2/resources/{g['app_id']}/request-conditions/{cond['id']}/activate")
         print(f"   {g['name']}: activate -> HTTP {ast}")
+    # Allow on-behalf-of requests so the SN bridge can request for other users (else 409).
+    bst, _ = call("PATCH", f"/governance/api/v2/resources/{g['app_id']}/request-settings",
+                  {"requestOnBehalfOfSettings": {"allowed": True, "type": "EVERYONE"}})
+    print(f"   {g['name']}: allow request-on-behalf -> HTTP {bst}")
 
 
 def list_entries():
