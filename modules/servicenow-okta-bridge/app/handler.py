@@ -44,6 +44,24 @@ GROUP_SYNC_FILTER = os.environ.get("GROUP_SYNC_FILTER", 'type eq "OKTA_GROUP"').
 JUSTIFICATION_FIELD_ID = os.environ.get("JUSTIFICATION_FIELD_ID", "").strip()
 SN_CATALOG_TABLE = os.environ.get("SN_CATALOG_TABLE", "u_okta_requestable").strip()
 
+# Flow 4 — Okta Access Requests V1 "Employee Onboarding (Pre-HR Feed)" request type.
+# Field ids verified 2026-06-10. NOTE: editing the request type in Okta regenerates these ids
+# (and SELECT options) — if creates start 409'ing, re-pull from a recent request of this type.
+ONBOARD_REQUEST_TYPE_ID = os.environ.get("ONBOARD_REQUEST_TYPE_ID", "6a14744c947ae2aa8be1c098").strip()
+ONBOARD_FIELD_IDS = {
+    "first_name":           "ce49d104-85aa-41e4-866f-bf26ef8f2f72",
+    "last_name":            "667f7565-a780-426f-9ba7-80d86fe16331",
+    "agency":               "a8807066-0af4-4d5d-bbc5-95f4236c9d98",  # SELECT (value -> array)
+    "job_title":            "452386bb-2e84-4aae-8773-59bbca36d976",
+    "manager":              "caa5363b-dc1f-4dac-9136-30654dbc3bef",
+    "manager_email":        "a7740982-222b-43a1-a244-acda23468575",
+    "start_date":           "f90e6301-da17-4274-b047-c67aaa1b2f24",  # DATE (ISO 8601)
+    "cardinal_employee_id": "448b6dd9-4dd5-465b-b43f-327c6ad858a7",
+    "email":                "5b97b903-19a2-450d-9bc1-642a2a044e11",
+    "username":             "ea0bb581-f50e-448d-a7b4-7b803e446bcc",
+}
+ONBOARD_SELECT_FIELDS = {"agency"}
+
 _secret_cache = None
 
 
@@ -167,6 +185,38 @@ def flow1_request(body):
     if status >= 300:
         return _json(status, {"error": "okta request failed", "okta": data})
     return _json(201, {"okta_request_id": (data or {}).get("id"), "status": (data or {}).get("status"),
+                       "ritm_sys_id": body.get("ritm_sys_id")})
+
+
+def flow4_onboarding(body):
+    """ServiceNow onboarding catalog request -> Okta Access Requests V1 request
+    ('Employee Onboarding (Pre-HR Feed)'). The SN submitter is mapped to an Okta user by email
+    and set as the requester; the new-hire details map to the request type's field values.
+    Okta runs the request type's approval + actions."""
+    email = (body.get("requested_for") or {}).get("email") or body.get("requester_email") or body.get("email")
+    if not email:
+        return _json(400, {"error": "requester email is required"})
+    uid = _resolve_user_id(email)
+    if not uid:
+        return _json(404, {"error": f"no Okta user for {email}"})
+    field_values = []
+    for key, fid in ONBOARD_FIELD_IDS.items():
+        val = body.get(key)
+        if val in (None, ""):
+            continue
+        if key in ONBOARD_SELECT_FIELDS and not isinstance(val, list):
+            val = [val]
+        field_values.append({"id": fid, "value": val})
+    subject = body.get("subject") or (
+        f"{body.get('first_name', '')} {body.get('last_name', '')} "
+        "— Employee Onboarding (Pre-HR Feed) via ServiceNow").strip()
+    req = {"requestTypeId": ONBOARD_REQUEST_TYPE_ID, "subject": subject,
+           "requesterUserIds": [uid], "requesterFieldValues": field_values}
+    status, data = _okta("POST", "/governance/api/v1/requests", body=req)
+    if status >= 300:
+        return _json(status, {"error": "okta v1 onboarding request failed", "okta": data})
+    return _json(201, {"okta_request_id": (data or {}).get("id"),
+                       "permalink_id": (data or {}).get("permalinkId"),
                        "ritm_sys_id": body.get("ritm_sys_id")})
 
 
@@ -301,6 +351,8 @@ def handler(event, context):
         return _json(400, {"error": "invalid JSON body"})
 
     try:
+        if method == "POST" and path == "/servicenow/onboarding":
+            return flow4_onboarding(body)
         if method == "POST" and path == "/servicenow/request":
             return flow1_request(body)
         if method == "POST" and path == "/servicenow/approved":
