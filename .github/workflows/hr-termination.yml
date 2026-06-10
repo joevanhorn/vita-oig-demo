@@ -24,7 +24,7 @@ on:
           - terminate
           - reactivate
       target:
-        description: "User to terminate/reactivate — user_id, username, or email (ignored for list)"
+        description: "User to terminate/reactivate — full name (e.g. Sarah Kim), display name, username, email, or user_id (ignored for list)"
         required: false
         type: string
       dry_run:
@@ -91,7 +91,7 @@ jobs:
         run: |
           DB="-h ${{ steps.creds.outputs.host }} -p ${{ steps.creds.outputs.port }} -U ${{ steps.creds.outputs.user }} -d ${{ steps.creds.outputs.db }}"
           echo "=== ACTIVE users (use one of these as the 'target') ==="
-          psql $DB -c "SELECT user_id, username, email, department, status FROM users WHERE status='ACTIVE' ORDER BY username;"
+          psql $DB -c "SELECT user_id, username, display_name, email, department, status FROM users WHERE status='ACTIVE' ORDER BY username;"
           {
             echo "## Active users"
             echo '```'
@@ -107,9 +107,15 @@ jobs:
           DB="-h ${{ steps.creds.outputs.host }} -p ${{ steps.creds.outputs.port }} -U ${{ steps.creds.outputs.user }} -d ${{ steps.creds.outputs.db }}"
           TARGET="${{ inputs.target }}"
           if [ -z "$TARGET" ]; then echo "::error::'target' is required for terminate"; exit 1; fi
-          if ! printf '%s' "$TARGET" | grep -Eq '^[A-Za-z0-9@._-]+$'; then echo "::error::invalid target '$TARGET'"; exit 1; fi
+          # Allow spaces so full names like "Sarah Kim" work. Apostrophes are rejected
+          # to keep the value safe to interpolate into SQL (use username/email for O'Brien-type names).
+          if ! printf '%s' "$TARGET" | grep -Eq '^[A-Za-z0-9@._ -]+$'; then echo "::error::invalid target '$TARGET'"; exit 1; fi
 
-          USERID=$(psql $DB -tAc "SELECT user_id FROM users WHERE user_id='$TARGET' OR lower(username)=lower('$TARGET') OR lower(email)=lower('$TARGET') LIMIT 1" | xargs)
+          # Resolve target against user_id / username / email / display_name / "first last".
+          # full name and display_name aren't UNIQUE, so refuse an ambiguous match.
+          MATCHES=$(psql $DB -tAc "SELECT user_id FROM users WHERE user_id='$TARGET' OR lower(username)=lower('$TARGET') OR lower(email)=lower('$TARGET') OR lower(display_name)=lower('$TARGET') OR lower(trim(coalesce(first_name,'')||' '||coalesce(last_name,'')))=lower('$TARGET')" | xargs)
+          if [ -n "$MATCHES" ] && [ "$(printf '%s\n' $MATCHES | wc -w)" -gt 1 ]; then echo "::error::'$TARGET' matches multiple users ($MATCHES) — use username, email, or user_id instead"; exit 1; fi
+          USERID="$MATCHES"
           if [ -z "$USERID" ]; then echo "::error::no user matches '$TARGET'"; exit 1; fi
           echo "Resolved '$TARGET' -> user_id=$USERID"
 
@@ -134,9 +140,15 @@ jobs:
           DB="-h ${{ steps.creds.outputs.host }} -p ${{ steps.creds.outputs.port }} -U ${{ steps.creds.outputs.user }} -d ${{ steps.creds.outputs.db }}"
           TARGET="${{ inputs.target }}"
           if [ -z "$TARGET" ]; then echo "::error::'target' is required for reactivate"; exit 1; fi
-          if ! printf '%s' "$TARGET" | grep -Eq '^[A-Za-z0-9@._-]+$'; then echo "::error::invalid target '$TARGET'"; exit 1; fi
+          # Allow spaces so full names like "Sarah Kim" work. Apostrophes are rejected
+          # to keep the value safe to interpolate into SQL (use username/email for O'Brien-type names).
+          if ! printf '%s' "$TARGET" | grep -Eq '^[A-Za-z0-9@._ -]+$'; then echo "::error::invalid target '$TARGET'"; exit 1; fi
 
-          USERID=$(psql $DB -tAc "SELECT user_id FROM users WHERE user_id='$TARGET' OR lower(username)=lower('$TARGET') OR lower(email)=lower('$TARGET') LIMIT 1" | xargs)
+          # Resolve target against user_id / username / email / display_name / "first last".
+          # full name and display_name aren't UNIQUE, so refuse an ambiguous match.
+          MATCHES=$(psql $DB -tAc "SELECT user_id FROM users WHERE user_id='$TARGET' OR lower(username)=lower('$TARGET') OR lower(email)=lower('$TARGET') OR lower(display_name)=lower('$TARGET') OR lower(trim(coalesce(first_name,'')||' '||coalesce(last_name,'')))=lower('$TARGET')" | xargs)
+          if [ -n "$MATCHES" ] && [ "$(printf '%s\n' $MATCHES | wc -w)" -gt 1 ]; then echo "::error::'$TARGET' matches multiple users ($MATCHES) — use username, email, or user_id instead"; exit 1; fi
+          USERID="$MATCHES"
           if [ -z "$USERID" ]; then echo "::error::no user matches '$TARGET'"; exit 1; fi
           echo "Resolved '$TARGET' -> user_id=$USERID"
 
