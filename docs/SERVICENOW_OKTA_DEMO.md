@@ -1,7 +1,7 @@
 # ServiceNow ↔ Okta Identity Governance — Integration Demo
 
 End-to-end integration between **ServiceNow** (`dev341881.service-now.com`) and **Okta Identity
-Governance** (`demo-vita-oig.oktapreview.com`) for the VITA OIG demo. Three flows, all in-repo
+Governance** (`demo-vita-oig.oktapreview.com`) for the VITA OIG demo. Four flows, all in-repo
 code (no Okta Workflows), bridged by a small AWS Lambda.
 
 > **10-minute demo tip:** the SC requests are already completed — show the finished
@@ -23,7 +23,8 @@ code (no Okta Workflows), bridged by a small AWS Lambda.
 - **Bridge** — Python AWS Lambda behind an API Gateway HTTP API (AWS acct `357013128720`,
   `us-east-1`). Base URL: `https://8n2advzr15.execute-api.us-east-1.amazonaws.com`.
   Routes: `POST /servicenow/request` (Flow 1), `POST /servicenow/approved` (Flow 2),
-  `POST /sync/groups` + `POST /sync/catalog` (Flow 3), `GET /healthz`.
+  `POST /sync/groups` + `POST /sync/catalog` (Flow 3), `POST /servicenow/onboarding` (Flow 4),
+  `GET /healthz`.
 - **Auth** — ServiceNow → bridge: header `x-bridge-secret` (GitHub env secret `SN_INBOUND_SECRET`).
   Bridge → Okta: SSWS token. Bridge → ServiceNow: basic auth. All held in one Secrets Manager
   secret `vita-oig-preview-servicenow-okta-bridge-creds`, populated by the deploy workflow.
@@ -36,9 +37,11 @@ code (no Okta Workflows), bridged by a small AWS Lambda.
 | Catalog category | **Okta Access** |
 | Catalog item (Flow 1) | **Okta Group Access (Okta-approved)** |
 | Catalog item (Flow 2) | **Okta Group Access (Manager approval)** |
+| Catalog item (Flow 4) | **(1) Employee Onboarding (Pre-HR Feed)** — built directly via the Table API (see follow-ups) |
 | Script Include | **OktaBridge** (POSTs to the bridge with `x-bridge-secret`) |
 | Business Rule (Flow 1) | **Okta Bridge - Flow1 submit** (`sc_req_item`, on insert) |
 | Business Rule (Flow 2) | **Okta Bridge - Flow2 approved** (`sc_req_item`, async on approval) |
+| Business Rule (Flow 4) | **Okta Bridge - Flow4 onboarding** (`sc_req_item`, on insert) |
 | Table | **`u_okta_groups`** — synced Okta groups (Flow 2 picker) |
 | Table | **`u_okta_requestable`** — synced requestable OIG entries (Flow 1 picker) |
 | System properties | `x_okta_bridge.url`, `x_okta_bridge.secret`, `x_okta_bridge.flow1_entry_id` |
@@ -135,6 +138,63 @@ mirror Okta. Talking point: *the catalog never drifts from Okta — it's synced.
 
 ---
 
+## Flow 4 — Employee Onboarding (Pre-HR Feed) via **Access Requests V1**
+
+A pre-HR-feed new hire is submitted in the ServiceNow catalog; on submit, an **Okta Access Requests
+V1** onboarding request is created and Okta runs the request type's approval + actions.
+
+> **Different API surface than Flow 1.** Flow 1 uses Governance **v2** (`/governance/api/v2/requests`,
+> catalog *entries*). Flow 4 targets the **Access Requests V1** request type
+> (`/governance/api/v1/requests`, `requestTypeId`) — same SSWS token, different endpoint.
+
+```
+SN catalog item "(1) Employee Onboarding (Pre-HR Feed)"   (10 fields; submitter = opened_by)
+  │
+  ▼
+Business Rule "Okta Bridge - Flow4 onboarding" (on insert)
+  │  OktaBridge.post('/servicenow/onboarding', {requester_email: <submitter>, first_name, last_name,
+  │                   agency, job_title, manager, manager_email, start_date, cardinal_employee_id,
+  │                   email, username})
+  ▼
+Bridge  POST /governance/api/v1/requests
+  │   requestTypeId     = 6a14744c947ae2aa8be1c098 ("(1) Employee Onboarding (Pre-HR Feed)")
+  │   requesterUserIds  = [ <submitter, resolved from email> ]
+  │   requesterFieldValues = [ {id, value} × 10 ]   (Agency → array; Start Date → ISO 8601)
+  ▼
+Okta Access Requests V1 request (status OPEN) → approval + request-type actions  ✅
+```
+
+**Field mapping (verified 2026-06-10):**
+
+| SN variable | Okta field id | Type |
+| --- | --- | --- |
+| `first_name` | `ce49d104-…2f72` | Text |
+| `last_name` | `667f7565-…6331` | Text |
+| `agency` | `a8807066-…9d98` | **SELECT** (value → array) |
+| `job_title` | `452386bb-…d976` | Text |
+| `manager` | `caa5363b-…dbef` | Text |
+| `manager_email` | `a7740982-…8575` | Text |
+| `start_date` | `f90e6301-…2f24` | **DATE** (ISO 8601) |
+| `cardinal_employee_id` | `448b6dd9-…58a7` | Text |
+| `email` | `5b97b903-…4e11` | Text |
+| `username` | `ea0bb581-…6bcc` | Text |
+
+> ⚠️ **V1 field ids change when the request type is edited** and are **not** returned by the
+> request-type GET. If creates start returning `409 … invalid according to requesterFields`, re-pull
+> the current ids from a recent request (`GET /governance/api/v1/requests/{id}` → `requesterFieldValues`)
+> and update `ONBOARD_FIELD_IDS` in `handler.py`. SELECT values must match exactly — only
+> **`VDH - Virginia Department of Health`** is currently a valid Agency option.
+
+**Submitter → requester:** the SN submitter (`opened_by`) email is mapped to an Okta user and set as
+`requesterUserIds`, so the submitter must exist in Okta. The new-hire details live in the form fields
+(the hire has no Okta account yet — "Pre-HR Feed").
+
+**Demo:** Service Catalog → **Okta Access** → **(1) Employee Onboarding (Pre-HR Feed)** → fill the
+form → submit → show the resulting **Okta Access Requests** request (10 fields populated, pending
+approval). Talking point: *HR-style onboarding originates in ServiceNow; Okta governs approval + provisioning.*
+
+---
+
 ## Repository map
 
 | Path | What |
@@ -168,6 +228,11 @@ mirror Okta. Talking point: *the catalog never drifts from Okta — it's synced.
   group/catalog sync is run on demand).
 - Make `POST /sync/groups` return `202` and self-invoke async so it doesn't `503` on large syncs
   (the work still completes today).
+- Fold the **Flow 4** catalog item + business rule into `scripts/setup_servicenow_integration.py`
+  (currently built directly via the Table API).
+- Confirm the full **Agency** option list for the V1 onboarding type — only
+  `VDH - Virginia Department of Health` is verified; `DSS - Department of Social Services` is **not**
+  a current option.
 
 ---
 
@@ -176,5 +241,7 @@ mirror Okta. Talking point: *the catalog never drifts from Okta — it's synced.
 - **Bridge:** `https://8n2advzr15.execute-api.us-east-1.amazonaws.com` · header `x-bridge-secret`
 - **ServiceNow:** `https://dev341881.service-now.com` · catalog category **Okta Access**
 - **Okta:** `https://demo-vita-oig.oktapreview.com` · approval sequence `6a2834ee7ba302ba900992d5`
+- **Onboarding (Flow 4):** Access Requests **V1** request type `6a14744c947ae2aa8be1c098` · SN item
+  **(1) Employee Onboarding (Pre-HR Feed)** · only verified Agency option `VDH - Virginia Department of Health`
 - **Requestable demo items:** `APP-HealthApp-Admin`, `APP-TransportationApp-Admin`,
   `APP-FinanceApp-Admin` (Health/Transportation/Finance Apps)
