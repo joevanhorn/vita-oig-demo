@@ -173,10 +173,14 @@ def flow1_request(body):
     if not rfv:
         # Auto-fill the entry's REQUIRED request fields (e.g. business justification) so the
         # ServiceNow side only has to pass justification text, not Okta field ids.
+        # Only fill free-text fields — system fields like OKTA_REQUESTED_FOR (type OKTA_USER_ID)
+        # are satisfied by the top-level requestedFor; stuffing them with justification text makes
+        # Okta auto-reject the request.
         just = body.get("justification") or "Requested via ServiceNow"
         fst, fields = _okta("GET", f"/governance/api/v2/my/catalogs/default/entries/{entry_id}/request-fields")
         rfv = [{"id": f["id"], "values": [just]}
-               for f in (fields or {}).get("data", []) if f.get("required")] if fst < 300 else []
+               for f in (fields or {}).get("data", [])
+               if f.get("required") and f.get("type") == "TEXT"] if fst < 300 else []
         if JUSTIFICATION_FIELD_ID and not any(x["id"] == JUSTIFICATION_FIELD_ID for x in rfv):
             rfv.append({"id": JUSTIFICATION_FIELD_ID, "values": [just]})
     if rfv:
